@@ -1,0 +1,168 @@
+"""Blender operators registered by Skybrush Studio for Blender."""
+
+from .add_drones_selected_to_drone_group import AddSelectedDronesToDroneGroupOperator
+from .add_markers_from_qr_code import AddMarkersFromQRCodeOperator
+from .add_markers_from_static_csv import AddMarkersFromStaticCSVOperator
+from .add_markers_from_svg import AddMarkersFromSVGOperator
+from .add_markers_from_zipped_csv import AddMarkersFromZippedCSVOperator
+from .add_markers_from_zipped_dss import AddMarkersFromZippedDSSOperator
+from .append_formation_to_storyboard import AppendFormationToStoryboardOperator
+from .apply_color import ApplyColorsToSelectedDronesOperator
+from .clear_drone_group import ClearDroneGroupOperator
+from .create_drone_group import CreateDroneGroupOperator
+from .create_formation import CreateFormationOperator
+from .create_light_effect import CreateLightEffectOperator
+from .create_new_schedule_override_entry import CreateNewScheduleOverrideEntryOperator
+from .create_new_storyboard_entry import CreateNewStoryboardEntryOperator
+from .create_takeoff_grid import CreateTakeoffGridOperator
+from .detach_materials_from_template import DetachMaterialsFromDroneTemplateOperator
+from .duplicate_light_effect import DuplicateLightEffectOperator
+from .export_light_effects import ExportLightEffectsOperator
+from .export_to_csv import SkybrushCSVExportOperator
+from .export_to_dac import DACExportOperator
+from .export_to_ddsf import DDSFExportOperator
+from .export_to_drotek import DrotekExportOperator
+from .export_to_dss import DSSPath3ExportOperator, DSSPathExportOperator
+from .export_to_evsky import EVSKYExportOperator
+from .export_to_finale_csv import FinaleCSVExportOperator
+from .export_to_kmz import KMZExportOperator
+from .export_to_litebee import LitebeeExportOperator
+from .export_to_pdf import SkybrushPDFExportOperator
+from .export_to_skyc import SkybrushExportOperator
+from .export_to_skyc_and_pdf import SkybrushSKYCAndPDFExportOperator
+from .export_to_vviz import VVIZExportOperator
+from .fix_constraint_ordering import FixConstraintOrderingOperator
+from .get_formation_stats import GetFormationStatisticsOperator
+from .import_light_effects import ImportLightEffectsOperator
+from .invalidate_light_effect_pixel_cache import (
+    InvalidateLightEffectPixelCacheOperator,
+)
+from .land import LandOperator
+from .move_drone_group import (
+    MoveDroneGroupDownOperator,
+    MoveDroneGroupUpOperator,
+)
+from .move_light_effect import (
+    MoveLightEffectDownOperator,
+    MoveLightEffectUpOperator,
+)
+from .move_storyboard_entry import (
+    MoveStoryboardEntryDownOperator,
+    MoveStoryboardEntryUpOperator,
+)
+from .prepare import PrepareSceneOperator
+from .recalculate_transitions import RecalculateTransitionsOperator
+from .refresh_file_formats import RefreshFileFormatsOperator
+from .register_hardware_id import RegisterHardwareIDOperator
+from .remove_drone_group import RemoveDroneGroupOperator
+from .remove_formation import RemoveFormationOperator
+from .remove_light_effect import RemoveLightEffectOperator
+from .remove_schedule_override_entry import RemoveScheduleOverrideEntryOperator
+from .remove_storyboard_entry import RemoveStoryboardEntryOperator
+from .reorder_formation_markers import ReorderFormationMarkersOperator
+from .return_to_home import ReturnToHomeOperator
+from .run_all_migrations import RunAllMigrationOperators
+from .run_full_proximity_check import RunFullProximityCheckOperator
+from .select_drones_from_drone_group import SelectDronesFromDroneGroup
+from .select_formation import DeselectFormationOperator, SelectFormationOperator
+from .select_storyboard_entry import SelectStoryboardEntryForCurrentFrameOperator
+from .set_gateway_url import SetGatewayURLOperator
+from .set_server_url import SetServerURLOperator
+from .set_time_of_light_effect import (
+    SetLightEffectEndFrameOperator,
+    SetLightEffectStartFrameOperator,
+)
+from .set_time_of_storyboard_entry import (
+    SetStoryboardEntryEndFrameOperator,
+    SetStoryboardEntryStartFrameOperator,
+)
+from .setup_scene import SetupSceneOperator
+from .swap_colors import SwapColorsInLEDControlPanelOperator
+from .takeoff import TakeoffOperator
+from .trigger_pyro import TriggerPyroOnSelectedDronesOperator
+from .update_formation import UpdateFormationOperator
+from .update_frame_range_from_storyboard import UpdateFrameRangeFromStoryboardOperator
+from .update_pyro_params import UpdatePyroParamsFromSelectedDroneOperator
+from .update_time_markers_from_storyboard import UpdateTimeMarkersFromStoryboardOperator
+from .use_vgroup_for_formation import UseSelectedVertexGroupForFormationOperator
+from .validate_trajectories import ValidateTrajectoriesOperator
+
+__all__ = (
+    "AddMarkersFromQRCodeOperator",
+    "AddMarkersFromStaticCSVOperator",
+    "AddMarkersFromSVGOperator",
+    "AddMarkersFromZippedCSVOperator",
+    "AddMarkersFromZippedDSSOperator",
+    "AddSelectedDronesToDroneGroupOperator",
+    "AppendFormationToStoryboardOperator",
+    "ApplyColorsToSelectedDronesOperator",
+    "ClearDroneGroupOperator",
+    "CreateDroneGroupOperator",
+    "CreateFormationOperator",
+    "CreateLightEffectOperator",
+    "CreateNewScheduleOverrideEntryOperator",
+    "CreateNewStoryboardEntryOperator",
+    "CreateTakeoffGridOperator",
+    "DACExportOperator",
+    "DDSFExportOperator",
+    "DeselectFormationOperator",
+    "DetachMaterialsFromDroneTemplateOperator",
+    "DrotekExportOperator",
+    "DSSPath3ExportOperator",
+    "DSSPathExportOperator",
+    "DuplicateLightEffectOperator",
+    "EVSKYExportOperator",
+    "ExportLightEffectsOperator",
+    "FinaleCSVExportOperator",
+    "FixConstraintOrderingOperator",
+    "GetFormationStatisticsOperator",
+    "ImportLightEffectsOperator",
+    "InvalidateLightEffectPixelCacheOperator",
+    "LandOperator",
+    "KMZExportOperator",
+    "LitebeeExportOperator",
+    "MoveDroneGroupDownOperator",
+    "MoveDroneGroupUpOperator",
+    "MoveLightEffectDownOperator",
+    "MoveLightEffectUpOperator",
+    "MoveStoryboardEntryDownOperator",
+    "MoveStoryboardEntryUpOperator",
+    "PrepareSceneOperator",
+    "RecalculateTransitionsOperator",
+    "RefreshFileFormatsOperator",
+    "RegisterHardwareIDOperator",
+    "RemoveDroneGroupOperator",
+    "RemoveDronesFromDroneGroupOperator",
+    "RemoveFormationOperator",
+    "RemoveLightEffectOperator",
+    "RemoveScheduleOverrideEntryOperator",
+    "RemoveStoryboardEntryOperator",
+    "ReorderFormationMarkersOperator",
+    "ReturnToHomeOperator",
+    "RunAllMigrationOperators",
+    "RunFullProximityCheckOperator",
+    "SelectDronesFromDroneGroup",
+    "SelectFormationOperator",
+    "SelectStoryboardEntryForCurrentFrameOperator",
+    "SetLightEffectEndFrameOperator",
+    "SetLightEffectStartFrameOperator",
+    "SetStoryboardEntryEndFrameOperator",
+    "SetStoryboardEntryStartFrameOperator",
+    "SetServerURLOperator",
+    "SetGatewayURLOperator",
+    "SetupSceneOperator",
+    "SkybrushCSVExportOperator",
+    "SkybrushExportOperator",
+    "SkybrushPDFExportOperator",
+    "SkybrushSKYCAndPDFExportOperator",
+    "SwapColorsInLEDControlPanelOperator",
+    "TakeoffOperator",
+    "TriggerPyroOnSelectedDronesOperator",
+    "UpdateFormationOperator",
+    "UpdateFrameRangeFromStoryboardOperator",
+    "UpdatePyroParamsFromSelectedDroneOperator",
+    "UpdateTimeMarkersFromStoryboardOperator",
+    "UseSelectedVertexGroupForFormationOperator",
+    "ValidateTrajectoriesOperator",
+    "VVIZExportOperator",
+)

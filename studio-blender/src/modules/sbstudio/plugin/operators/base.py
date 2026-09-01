@@ -1,0 +1,609 @@
+from __future__ import annotations
+
+import logging
+import os
+from abc import abstractmethod
+from dataclasses import dataclass, field
+from typing import Any
+
+import bpy
+from bpy.props import BoolProperty, EnumProperty
+from bpy.types import Collection, Context, FCurve, Operator
+from bpy_extras.io_utils import ExportHelper
+from numpy import array, floating
+from numpy.typing import NDArray
+
+from sbstudio.api.errors import SkybrushStudioAPIError
+from sbstudio.model.file_formats import FileFormat
+from sbstudio.model.light_program import LightProgram
+from sbstudio.model.point import Point3D
+from sbstudio.model.trajectory import Trajectory
+from sbstudio.model.types import Coordinate3D
+from sbstudio.plugin.actions import (
+    ensure_animation_data_exists_for_object,
+    ensure_f_curve_exists_for_data_path_and_index,
+)
+from sbstudio.plugin.errors import StoryboardValidationError
+from sbstudio.plugin.model.drone_groups import DroneGroupsProperties, get_drone_groups
+from sbstudio.plugin.model.formation import (
+    add_points_to_formation,
+    get_markers_from_formation,
+)
+from sbstudio.plugin.model.light_effects import LightEffectCollection
+from sbstudio.plugin.model.storyboard import Storyboard, StoryboardEntry, get_storyboard
+from sbstudio.plugin.props.frame_range import FrameRangeProperty
+from sbstudio.plugin.selection import Collections, select_only
+
+log = logging.getLogger(__name__)
+
+
+class FormationOperator(Operator):
+    """Operator mixin that allows an operator to be executed if we have a
+    selected formation in the current scene.
+    """
+
+    @classmethod
+    def poll(cls, context: Context):
+        return (
+            context.scene.skybrush
+            and context.scene.skybrush.formations
+            and (
+                getattr(cls, "works_with_no_selected_formation", False)
+                or context.scene.skybrush.formations.selected
+            )
+        )
+
+    def execute(self, context: Context):
+        formation = self.get_formation(context)
+        return self.execute_on_formation(formation, context)
+
+    def execute_on_formation(self, formation: Collection | None, context: Context):
+        raise NotImplementedError
+
+    def get_formation(self, context: Context) -> Collection | None:
+        return getattr(context.scene.skybrush.formations, "selected", None)
+
+    @staticmethod
+    def select_formation(formation: Collection, context: Context) -> None:
+        """Selects the given formation, both in the scene and in the formations
+        panel.
+        """
+        select_only(formation)
+        if context.scene.skybrush.formations:
+            context.scene.skybrush.formations.selected = formation
+
+
+class LightEffectOperator(Operator):
+    """Operator mixin that allows an operator to be executed if we have a
+    light effects object in the current scene.
+    """
+
+    @classmethod
+    def poll(cls, context: Context):
+        return context.scene.skybrush and context.scene.skybrush.light_effects
+
+    def execute(self, context: Context):
+        light_effects = context.scene.skybrush.light_effects
+        return self.execute_on_light_effect_collection(light_effects, context)
+
+    def execute_on_light_effect_collection(
+        self, light_effects: LightEffectCollection, context: Context
+    ):
+        raise NotImplementedError
+
+
+class StoryboardOperator(Operator):
+    """Operator mixin that allows an operator to be executed if we have a
+    storyboard in the current scene.
+    """
+
+    @classmethod
+    def poll(cls, context: Context):
+        return context.scene.skybrush and context.scene.skybrush.storyboard
+
+    def execute(self, context: Context):
+        storyboard = get_storyboard(context=context)
+
+        validate = getattr(self.__class__, "only_with_valid_storyboard", False)
+
+        if validate:
+            try:
+                entries = storyboard.validate_and_sort_entries()
+            except StoryboardValidationError as ex:
+                self.report({"ERROR_INVALID_INPUT"}, str(ex))
+                return {"CANCELLED"}
+
+            return self.execute_on_storyboard(storyboard, entries, context)
+        else:
+            return self.execute_on_storyboard(storyboard, context)
+
+    def execute_on_storyboard(self, storyboard: Storyboard, *args, **kwargs):
+        raise NotImplementedError
+
+
+class StoryboardEntryOperator(Operator):
+    """Operator mixin that allows an operator to be executed if we have a
+    selected storyboard entry in the current scene.
+    """
+
+    @classmethod
+    def poll(cls, context: Context):
+        return (
+            context.scene.skybrush
+            and context.scene.skybrush.storyboard
+            and context.scene.skybrush.storyboard.active_entry
+        )
+
+    def execute(self, context: Context):
+        entry = get_storyboard(context=context).active_entry
+        return self.execute_on_storyboard_entry(entry, context)
+
+    def execute_on_storyboard_entry(
+        self, entry: StoryboardEntry | None, context: Context
+    ):
+        raise NotImplementedError
+
+
+class DroneGroupOperator(Operator):
+    """Operator mixin that allows an operator to be executed if we have a
+    selected drone group in the drone groups panel.
+    """
+
+    @classmethod
+    def poll(cls, context: Context):
+        return (
+            context.scene.skybrush
+            and context.scene.skybrush.drone_groups
+            and context.scene.skybrush.drone_groups.active_group
+        )
+
+    def execute(self, context: Context):
+        drone_groups = get_drone_groups(context=context)
+
+        group = drone_groups.active_group
+        if group is None:
+            self.report({"ERROR"}, "No drone group selected")
+            return {"CANCELLED"}
+
+        return self.execute_on_drone_group(group, drone_groups, context)
+
+    def execute_on_drone_group(
+        self, group: Collection, drone_groups: DroneGroupsProperties, context: Context
+    ) -> set[str]:
+        raise NotImplementedError
+
+
+class ExportOperator(Operator, ExportHelper):
+    """Operator mixin for operators that export the scene in some format using
+    the Skybrush Studio API.
+    """
+
+    # whether to output all objects or only selected ones
+    export_selected = BoolProperty(
+        name="Export selected drones only",
+        default=False,
+        description=(
+            "Export only the selected drones. "
+            "Uncheck to export all drones, irrespectively of the selection."
+        ),
+    )
+
+    # frame range
+    frame_range = FrameRangeProperty(default="RENDER")
+
+    # whether to redraw the scene during export
+    redraw = EnumProperty(
+        name="Redraw frames",
+        items=[
+            (
+                "AUTO",
+                "Auto",
+                "Redraw the scene only if necessary for the light effects to work correctly",
+            ),
+            (
+                "ALWAYS",
+                "Always",
+                "Redraw the scene even if it would not be needed for the light effects",
+            ),
+            (
+                "NEVER",
+                "Never",
+                "Do not redraw the scene even if it would be needed for the light effects",
+            ),
+        ],
+        default="AUTO",
+        description="Whether to redraw the scene during export after every frame",
+    )
+
+    def execute(self, context: Context):
+        from sbstudio.plugin.api import call_api_from_blender_operator
+
+        from .utils import export_show_to_file_using_api
+
+        # Blender often returns //relative paths (or a bare filename when the
+        # .blend is unsaved). Resolve to an absolute path before writing so the
+        # file lands where the user expects and the success message is useful.
+        filepath = bpy.path.ensure_ext(self.filepath, self.filename_ext)
+        filepath = os.path.normpath(bpy.path.abspath(filepath))
+
+        if os.path.basename(filepath).lower() == self.filename_ext.lower():
+            self.report({"ERROR_INVALID_INPUT"}, "Filename must not be empty")
+            return {"CANCELLED"}
+
+        settings = {
+            "export_selected": self.export_selected,
+            "frame_range": self.frame_range,
+            "redraw": self._get_redraw_setting(),
+            **self.get_settings(),
+        }
+
+        file_format = self.get_format()
+
+        try:
+            # .skyc is exported locally and does not need Studio Server.
+            if file_format is FileFormat.SKYC:
+                export_show_to_file_using_api(
+                    None, context, settings, filepath, file_format
+                )
+            else:
+                with call_api_from_blender_operator(
+                    self, self.get_operator_name()
+                ) as api:
+                    if api is None:
+                        self.report(
+                            {"ERROR"},
+                            "This export format requires Skybrush Studio Server; "
+                            "no API connection is available.",
+                        )
+                        return {"CANCELLED"}
+                    export_show_to_file_using_api(
+                        api, context, settings, filepath, file_format
+                    )
+        except Exception as ex:
+            # Server-backed formats are already reported by call_api_from_blender_operator.
+            # Local .skyc needs an explicit report here.
+            if file_format is FileFormat.SKYC:
+                from sbstudio.errors import SkybrushStudioError
+                from sbstudio.plugin.errors import SkybrushStudioExportWarning
+
+                if isinstance(ex, SkybrushStudioExportWarning):
+                    self.report({"WARNING"}, str(ex))
+                elif isinstance(ex, SkybrushStudioError):
+                    self.report({"ERROR"}, ex.format_message() or str(ex))
+                else:
+                    self.report({"ERROR"}, f"Export failed: {ex}")
+            return {"CANCELLED"}
+
+        if not os.path.isfile(filepath):
+            self.report(
+                {"ERROR"},
+                f"Export finished but the file was not found at: {filepath}",
+            )
+            return {"CANCELLED"}
+
+        size_kb = os.path.getsize(filepath) / 1024.0
+        self.report(
+            {"INFO"}, f"Export successful: {filepath} ({size_kb:.1f} KB)"
+        )
+        return {"FINISHED"}
+
+    def get_format(self) -> FileFormat:
+        """Returns the file format that the operator uses. Must be overridden
+        in subclasses.
+        """
+        raise NotImplementedError
+
+    def get_operator_name(self) -> str:
+        """Returns the name of the operator to be used in error messages when
+        the operation fails.
+        """
+        return "exporter"
+
+    def get_settings(self) -> dict[str, Any]:
+        """Returns operator-specific renderer settings that should be passed to
+        the Skybrush Studio API.
+        """
+        return {}
+
+    def invoke(self, context: Context, event):
+        if not hasattr(self, "filename_ext") or not self.filename_ext:
+            raise RuntimeError("filename_ext not defined in exporter class")
+
+        if not self.filepath:
+            if bpy.data.filepath:
+                filepath, _ = os.path.splitext(bpy.data.filepath)
+                self.filepath = f"{filepath}{self.filename_ext}"
+            else:
+                # Unsaved .blend: default into Documents so a bare relative
+                # name like "Untitled.skyc" is not written into Blender's CWD.
+                documents = os.path.join(os.path.expanduser("~"), "Documents")
+                self.filepath = os.path.join(
+                    documents, f"Untitled{self.filename_ext}"
+                )
+
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _get_redraw_setting(self) -> bool | None:
+        """Returns the redraw setting for the operator. This is used to
+        determine whether to redraw the scene during export.
+        """
+        if self.redraw == "AUTO":
+            return None
+        elif self.redraw == "ALWAYS":
+            return True
+        else:
+            return False
+
+
+@dataclass
+class TrajectoryAndLightProgram:
+    timestamps: list[float] = field(default_factory=list)
+    """Timestamps corresponding to ??? TODO ???"""
+
+    trajectory: Trajectory = field(default_factory=Trajectory)
+    """The trajectory to create in a dynamic marker creation operator."""
+
+    light_program: LightProgram = field(default_factory=LightProgram)
+    """Optional light program associated with the trajectory."""
+
+
+class DynamicMarkerCreationOperator(FormationOperator):
+    """Base class for operators that create a set of dynamic markers for a
+    formation, with light animation corresponding to the formation.
+    """
+
+    def execute_on_formation(self, formation: Collection | None, context: Context):
+        assert formation is not None
+        # Construct the trajectory and light program to set
+        try:
+            trajectories_and_lights = self._create_trajectories(context)
+        except SkybrushStudioAPIError:
+            # No need to report, already handled internally
+            return {"CANCELLED"}
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        # determine FPS of scene
+        fps = context.scene.render.fps
+
+        # try to figure out the start frame of this formation
+        storyboard_entry = get_storyboard(
+            context=context
+        ).get_first_entry_for_formation(formation)
+        frame_start = (
+            storyboard_entry.frame_start
+            if storyboard_entry
+            else context.scene.frame_start
+        )
+
+        # create new markers for the points around cursor location
+        center = Point3D(*context.scene.cursor.location)
+        trajectories: list[Trajectory] = [
+            item.trajectory.shift_in_place(center)
+            for item in trajectories_and_lights.values()
+        ]
+        first_points: list[Coordinate3D] = []
+        for trajectory in trajectories:
+            point = trajectory.first_point
+            assert point is not None
+
+            first_points.append(point.as_3d().as_tuple())
+        markers = add_points_to_formation(formation, first_points)
+
+        # ensure that we have animation data for the markers and that it is clean
+        for marker in markers:
+            ensure_animation_data_exists_for_object(marker, clean=True)
+
+        # update storyboard duration based on animation data
+        if bool(getattr(self, "update_duration", False)) and storyboard_entry:
+            duration = (
+                int(max(trajectory.duration for trajectory in trajectories) * fps) + 1
+            )
+            storyboard_entry.duration = duration
+
+        # create animation action for each point in the formation
+        log.info("Creating trajectories...")
+        for trajectory, marker in zip(trajectories, markers):
+            trajectory.simplify_in_place()
+            if len(trajectory.points) <= 1:
+                # does not need animation so we don't create the action
+                continue
+
+            f_curves: list[FCurve] = []
+            for i in range(3):
+                f_curve = ensure_f_curve_exists_for_data_path_and_index(
+                    marker, data_path="location", index=i
+                )
+                f_curves.append(f_curve)
+
+            # add keypoints to f-curves in low level mode
+            t0 = trajectory.points[0].t
+            frames = [frame_start + round((p.t - t0) * fps) for p in trajectory.points]
+            values_x = [p.x for p in trajectory.points]
+            values_y = [p.y for p in trajectory.points]
+            values_z = [p.z for p in trajectory.points]
+            for f_curve, values in zip(f_curves, [values_x, values_y, values_z]):
+                f_curve.keyframe_points.add(len(frames))
+                for i, (frame, value) in enumerate(zip(frames, values)):
+                    kp = f_curve.keyframe_points[i]
+                    kp.co = (frame, value)
+                    kp.interpolation = "LINEAR"
+                    kp.handle_left_type = "AUTO_CLAMPED"
+                    kp.handle_right_type = "AUTO_CLAMPED"
+
+            # Commit the insertions that we've made in low level mode
+            for f_curve in f_curves:
+                f_curve.update()
+
+        # store light program as a light effect with color image
+        log.info("Creating light effects...")
+        light_effects = context.scene.skybrush.light_effects
+        light_programs = [
+            item.light_program for item in trajectories_and_lights.values()
+        ]
+        if light_effects and light_programs:
+            duration = (
+                int(
+                    (light_programs[0].colors[-1].t - light_programs[0].colors[0].t)
+                    * fps
+                )
+                + 1
+            )
+            light_effects.append_new_entry(
+                name=formation.name,
+                frame_start=frame_start,
+                duration=duration,
+                select=True,
+            )
+            light_effect = light_effects.active_entry
+            assert light_effect is not None
+
+            light_effect.type = "IMAGE"
+            light_effect.output = "TEMPORAL"
+            light_effect.output_y = "INDEXED_BY_FORMATION"
+            image = light_effect.create_color_image(
+                name="Image for light effect '{}'".format(formation.name),
+                width=duration,
+                height=len(light_programs),
+            )
+            pixels = []
+            for light_program in light_programs:
+                color = light_program.colors[0]
+                t0 = color.t
+                j_last = 0
+                for next_color in light_program.colors[1:]:
+                    j_next = round((next_color.t - t0) * fps)
+                    pixels.extend(list(color.as_vector()) * (j_next - j_last))
+                    j_last = j_next
+                    color = next_color
+                pixels.extend(list(color.as_vector()))
+            image.pixels.foreach_set(pixels)
+            image.pack()
+
+        if not trajectories_and_lights:
+            self.report(
+                {"WARNING"}, "No trajectories or light programs were found in the input"
+            )
+
+        return {"FINISHED"}
+
+    @abstractmethod
+    def _create_trajectories(
+        self, context: Context
+    ) -> dict[str, TrajectoryAndLightProgram]:
+        """Creates the trajectories and light programs where the markers should be placed."""
+        raise NotImplementedError
+
+
+@dataclass
+class PointsAndColors:
+    points: NDArray[floating]
+    """The points to create in a static marker creation operation, in a NumPy
+    array where each row is a point.
+    """
+
+    colors: NDArray[floating] | None = None
+    """Optional colors corresponding to the points in a marker creation
+    operation, in a NumPy array where the i-th row is the color of the i-th
+    point in RGBA space; color components must be specified in the range [0; 1].
+    """
+
+
+class StaticMarkerCreationOperator(FormationOperator):
+    """Base class for operators that create a set of markers for a formation,
+    optionally extended with a list of colors corresponding to the points.
+    """
+
+    def execute_on_formation(self, formation: Collection | None, context: Context):
+        assert formation is not None
+        # Construct the point set
+        try:
+            points_and_colors = self._create_points(context)
+        except SkybrushStudioAPIError:
+            # No need to report, already handled internally
+            return {"CANCELLED"}
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        points = points_and_colors.points
+        colors = points_and_colors.colors
+
+        if len(points) < 1:
+            self.report({"ERROR"}, "Formation would be empty, nothing was created")
+            return {"CANCELLED"}
+
+        # Align the center of the bounding box of the point set to the origin
+        mins, maxs = points.min(axis=0), points.max(axis=0)
+        points -= (maxs + mins) / 2
+
+        # Move the origin of the point set to the 3D cursor
+        points += array(context.scene.cursor.location, dtype=float)
+
+        # Create the markers
+        add_points_to_formation(formation, points.tolist())
+
+        # Decide whether we should import the colors of the markers as well
+        should_import_colors = (
+            bool(getattr(self, "import_colors", True)) and colors is not None
+        )
+
+        # Add a light effect containing the colors of the markers if needed
+        if should_import_colors:
+            # try to figure out the start frame of this formation
+            storyboard_entry = get_storyboard(
+                context=context
+            ).get_first_entry_for_formation(formation)
+            frame_start = (
+                storyboard_entry.frame_start
+                if storyboard_entry
+                else context.scene.frame_start
+            )
+            duration = storyboard_entry.duration if storyboard_entry else 1
+
+            # add a light effect from the imported colors
+            light_effects = context.scene.skybrush.light_effects
+            if light_effects:
+                light_effects.append_new_entry(
+                    name=formation.name,
+                    frame_start=frame_start,
+                    duration=duration,
+                    select=True,
+                )
+                light_effect = light_effects.active_entry
+                assert light_effect is not None
+
+                light_effect.output = "TEMPORAL"
+                light_effect.output_y = "INDEXED_BY_FORMATION"
+                light_effect.type = "IMAGE"
+                image = light_effect.create_color_image(
+                    name="Image for light effect '{}'".format(formation.name),
+                    width=1,
+                    height=len(colors),
+                )
+                image.pixels.foreach_set(list(colors.flat))
+                image.pack()
+
+        return {"FINISHED"}
+
+    @abstractmethod
+    def _create_points(self, context: Context) -> PointsAndColors:
+        """Creates the points where the markers should be placed."""
+        raise NotImplementedError
+
+    def _propose_marker_count(self, context: Context) -> int:
+        """Calculates how many markers we need to add to the currently selected
+        formation in order to make it have exactly the same number of markers
+        as the number of drones in the project.
+        """
+        drones = Collections.find_drones(create=False)
+        num_drones = len(drones.objects) if drones else 0
+        if num_drones > 0:
+            num_existing_markers = len(
+                get_markers_from_formation(context.scene.skybrush.formations.selected)
+            )
+        else:
+            num_existing_markers = 0
+        return max(0, num_drones - num_existing_markers)

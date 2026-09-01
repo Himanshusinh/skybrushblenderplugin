@@ -1,0 +1,12 @@
+.venv/
+.vscode/
+__pycache__/
+dev/
+dist/
+dist-*/
+doc/*.pdf
+etc/test-scenes/
+tmp/
+
+modules/skybrush
+modules/pyledctrl

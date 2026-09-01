@@ -1,0 +1,121 @@
+from bpy.types import Context, Panel
+
+from sbstudio.plugin.operators import (
+    RunFullProximityCheckOperator,
+    ValidateTrajectoriesOperator,
+)
+
+__all__ = ("SafetyCheckPanel",)
+
+
+class SafetyCheckPanel(Panel):
+    """Custom Blender panel that allows the user to set the parameters of the
+    flight safety checks and to inspect the minimum distance and maximum
+    velocity of the drones in the current Blender frame.
+    """
+
+    bl_idname = "OBJECT_PT_skybrush_safety_check_panel"
+    bl_label = "Safety Check"
+
+    # The following three settings determine that the safety check panel gets
+    # added to the sidebar of the 3D view
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Safety & Export"
+
+    @classmethod
+    def poll(cls, context: Context):
+        return context.scene.skybrush.safety_check
+
+    def draw_header(self, context: Context):
+        scene = context.scene
+        safety_check = scene.skybrush.safety_check
+
+        if safety_check:
+            self.layout.prop(safety_check, "enabled", text="")
+
+    def draw(self, context: Context):
+        scene = context.scene
+        safety_check = scene.skybrush.safety_check
+        settings = scene.skybrush.settings
+
+        if not safety_check or not settings:
+            return
+
+        layout = self.layout
+
+        row = layout.row()
+        row.enabled = safety_check.enabled
+
+        col = row.column()
+
+        # General settings
+
+        if safety_check.enabled:
+            col.prop(safety_check, "marker_size")
+            col.separator()
+
+        # Proximity warning widgets
+
+        col.prop(safety_check, "proximity_warning_enabled")
+        row = col.row()
+        row.prop(safety_check, "proximity_warning_threshold", text="", slider=True)
+        row.enabled = safety_check.proximity_warning_enabled
+        row = col.row()
+        row.prop(safety_check, "proximity_warning_target", text="")
+        row.enabled = safety_check.proximity_warning_enabled
+
+        # Altitude warning widgets
+
+        col.prop(safety_check, "altitude_warning_enabled")
+
+        row = col.row()
+        row.prop(safety_check, "min_navigation_altitude", text="Low", slider=True)
+        row.prop(safety_check, "altitude_warning_threshold", text="High", slider=True)
+        row.enabled = safety_check.altitude_warning_enabled
+
+        # Velocity warning widgets
+
+        col.prop(safety_check, "velocity_warning_enabled")
+
+        row = col.row()
+        row.prop(safety_check, "velocity_xy_warning_threshold", text="XY", slider=True)
+        row.enabled = safety_check.velocity_warning_enabled
+
+        row = col.row()
+        row.prop(
+            safety_check,
+            "velocity_z_warning_threshold",
+            text="Down" if safety_check.velocity_z_warning_different_up else "Z",
+            slider=True,
+        )
+        row.prop(safety_check, "velocity_z_warning_different_up", text="")
+        col2 = row.column()
+        col2.prop(
+            safety_check,
+            "velocity_z_warning_threshold_up",
+            text="Up" if safety_check.velocity_z_warning_different_up else "Z",
+            slider=True,
+        )
+        col2.enabled = safety_check.velocity_z_warning_different_up
+        row.enabled = safety_check.velocity_warning_enabled
+
+        # Acceleration warning widgets
+
+        col.prop(safety_check, "acceleration_warning_enabled")
+        row = col.row()
+        row.prop(safety_check, "acceleration_warning_threshold", text="", slider=True)
+        row.enabled = safety_check.acceleration_warning_enabled
+
+        # Yaw rate warning widgets
+
+        col.prop(safety_check, "yaw_rate_warning_enabled")
+        row = col.row()
+        row.prop(safety_check, "yaw_rate_warning_threshold", text="", slider=True)
+        row.enabled = safety_check.yaw_rate_warning_enabled
+
+        # Miscellaneous
+        layout.separator()
+
+        layout.operator(RunFullProximityCheckOperator.bl_idname)
+        layout.operator(ValidateTrajectoriesOperator.bl_idname)

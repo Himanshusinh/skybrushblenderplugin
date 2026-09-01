@@ -1,0 +1,409 @@
+from collections.abc import Sequence
+from functools import partial
+from math import ceil, sqrt
+
+import bpy
+from bpy.props import BoolProperty, FloatProperty, IntProperty
+from bpy.types import Context, Object
+
+from sbstudio.errors import SkybrushStudioError
+from sbstudio.model.types import Coordinate3D
+from sbstudio.plugin.actions import (
+    ensure_animation_data_exists_for_object,
+    ensure_f_curve_exists_for_data_path_and_index,
+)
+from sbstudio.plugin.api import call_api_from_blender_operator
+from sbstudio.plugin.constants import Collections
+from sbstudio.plugin.model.formation import create_formation, get_markers_from_formation
+from sbstudio.plugin.model.safety_check import get_proximity_warning_threshold
+from sbstudio.plugin.model.storyboard import (
+    Storyboard,
+    StoryboardEntryPurpose,
+    get_storyboard,
+)
+from sbstudio.plugin.utils.evaluator import create_position_evaluator
+
+from .base import StoryboardOperator
+from .takeoff import create_helper_formation_for_takeoff_and_landing
+
+__all__ = ("ReturnToHomeOperator",)
+
+
+def is_smart_rth_enabled_globally() -> bool:
+    # Smart RTH used to be an experimental feature but we are now releasing it
+    # for testing by a larger audience.
+    return True
+
+
+def use_custom_spacing_updated(self, context: Context):
+    """Called when the use_custom_spacing checkbox is enabled or disabled by the user."""
+    if not self.use_custom_spacing:
+        self.spacing = get_proximity_warning_threshold(context)
+
+
+class ReturnToHomeOperator(StoryboardOperator):
+    """Blender operator that adds a return-to-home transition to the show."""
+
+    bl_idname = "skybrush.rth"
+    bl_label = "Return Drones to Home Positions"
+    bl_description = "Add a return-to-home maneuver to all the drones"
+    bl_options = {"REGISTER", "UNDO"}
+
+    only_with_valid_storyboard = True
+
+    start_frame = IntProperty(
+        name="at Frame", description="Start frame of the return-to-home maneuver"
+    )
+
+    velocity = FloatProperty(
+        name="with Velocity",
+        description="Average horizontal velocity during the return-to-home maneuver",
+        default=4,
+        min=0.1,
+        soft_min=0.1,
+        soft_max=10,
+        unit="VELOCITY",
+    )
+
+    velocity_z = FloatProperty(
+        name="with Velocity Z",
+        description="Average vertical velocity during the return-to-home maneuver",
+        default=2,
+        min=0.1,
+        soft_min=0.1,
+        soft_max=10,
+        unit="VELOCITY",
+    )
+
+    altitude = FloatProperty(
+        name="to Altitude",
+        description="Altitude to return-to-home to",
+        default=10,
+        soft_min=-50,
+        soft_max=50,
+        unit="LENGTH",
+    )
+
+    use_custom_spacing = BoolProperty(
+        name="Use custom spacing",
+        default=False,
+        description="When checked, a custom spacing can be given instead of the default proximity warning threshold",
+        update=use_custom_spacing_updated,
+    )
+
+    spacing = FloatProperty(
+        name="Spacing",
+        description="Grid spacing for RTH or minimum distance for smart RTH",
+        default=3,
+        min=0.1,
+        soft_max=50,
+        unit="LENGTH",
+    )
+
+    altitude_shift = FloatProperty(
+        name="Layer height",
+        description=(
+            "Specifies the difference between altitudes of landing layers "
+            "for multi-phase landings when multiple drones occupy the same "
+            "slot within safety distance"
+        ),
+        default=5,
+        soft_min=0,
+        soft_max=50,
+        unit="LENGTH",
+    )
+
+    use_smart_rth = BoolProperty(
+        name="Use smart RTH (PRO)",
+        description=(
+            "Enable the smart return to home function that ensures that "
+            "all drones return to their own home position with an optimal "
+            "collision free smart transition"
+        ),
+        default=False,
+    )
+
+    to_aerial_grid = BoolProperty(
+        name="Return to aerial grid (PRO)",
+        description=(
+            "If enabled, drones will use a special planner to return to an "
+            "aerial grid above home and will not land automatically afterwards. "
+            "If disabled, drones will use the standard smart RTH algorithm and "
+            "finish the procedure with landing to the desired common altitude"
+        ),
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context: Context):
+        if not super().poll(context):
+            return False
+
+        drones = Collections.find_drones(create=False)
+        return drones is not None and len(drones.objects) > 0
+
+    def draw(self, context: Context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        use_smart_rth = self._should_use_smart_rth()
+        to_aerial_grid = self._should_return_to_aerial_grid()
+
+        layout.prop(self, "start_frame")
+        if use_smart_rth:
+            # TODO: labels XY and Z consume too much space...
+            row = layout.row()
+            row.prop(self, "velocity")
+            row.separator()
+            row.label(text="XY")
+            row.separator()
+            row.prop(self, "velocity_z", text="")
+            row.separator()
+            row.label(text="Z")
+        else:
+            layout.prop(self, "velocity")
+        layout.prop(self, "altitude")
+        if not use_smart_rth or to_aerial_grid:
+            row = layout.row()
+            row.prop(self, "altitude_shift")
+            if self.altitude_shift < self.spacing:
+                row.alert = True
+                row.label(text="", icon="ERROR")
+        row = layout.row(heading="Spacing")
+        row.prop(self, "use_custom_spacing", text="")
+        row = row.row()
+        row.prop(self, "spacing", text="")
+        row.enabled = self.use_custom_spacing
+        if self.spacing < get_proximity_warning_threshold(context):
+            row.alert = True
+            row.label(text="", icon="ERROR")
+
+        if is_smart_rth_enabled_globally():
+            layout.prop(self, "use_smart_rth")
+            if use_smart_rth:
+                layout.prop(self, "to_aerial_grid")
+
+    def invoke(self, context, event):
+        self.start_frame = max(
+            context.scene.frame_current, get_storyboard(context=context).frame_end
+        )
+        if not self.use_custom_spacing:
+            self.spacing = get_proximity_warning_threshold(context)
+
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute_on_storyboard(self, storyboard: Storyboard, entries, context: Context):
+        try:
+            success = self._run(storyboard, context=context)
+        except SkybrushStudioError:
+            # These are handled nicely
+            success = False
+        return {"FINISHED"} if success else {"CANCELLED"}
+
+    def _should_use_smart_rth(self) -> bool:
+        return self.use_smart_rth and is_smart_rth_enabled_globally()
+
+    def _should_return_to_aerial_grid(self) -> bool:
+        return self._should_use_smart_rth() and self.to_aerial_grid
+
+    def _run(self, storyboard: Storyboard, *, context: Context) -> bool:
+        bpy.ops.skybrush.prepare()
+
+        if not self._validate_start_frame(context):
+            return False
+
+        drones = Collections.find_drones().objects
+        if not drones:
+            return False
+
+        use_smart_rth = self._should_use_smart_rth()
+        to_aerial_grid = self._should_return_to_aerial_grid()
+        self.start_frame = max(self.start_frame, storyboard.frame_end) + (
+            1 if use_smart_rth else 0
+        )
+
+        with create_position_evaluator() as get_positions_of:
+            source = get_positions_of(drones, frame=self.start_frame)
+
+        first_frame = storyboard.frame_start
+        _, target, _ = create_helper_formation_for_takeoff_and_landing(
+            drones,
+            frame=first_frame,
+            base_altitude=self.altitude,
+            layer_height=0
+            if (use_smart_rth and not to_aerial_grid)
+            else self.altitude_shift,
+            min_distance=self.spacing,
+            flatten_source=to_aerial_grid,
+            operator=self,
+        )
+
+        run_rth = self._run_smart_rth if use_smart_rth else self._run_base_rth
+        result = run_rth(storyboard, source=source, target=target, context=context)
+
+        # Recalculate the transition leading to the target formation
+        bpy.ops.skybrush.recalculate_transitions(scope="TO_SELECTED")
+        return result
+
+    def _run_base_rth(
+        self,
+        storyboard: Storyboard,
+        *,
+        source: Sequence[Coordinate3D],
+        target: Sequence[Coordinate3D],
+        context: Context,
+    ) -> bool:
+        fps = context.scene.render.fps
+        diffs = [
+            sqrt((s[0] - t[0]) ** 2 + (s[1] - t[1]) ** 2 + (s[2] - t[2]) ** 2)
+            for s, t in zip(source, target)
+        ]
+
+        # Calculate RTH duration from max distance to travel and the
+        # average velocity
+        max_distance = max(diffs)
+        rth_duration = int(ceil((max_distance / self.velocity) * fps))
+
+        # Extend the duration of the last formation to the frame where we want
+        # to start the RTH maneuver
+        last_entry = storyboard.last_entry
+        if last_entry is not None:
+            last_entry.extend_until(self.start_frame)
+
+        # Calculate when the RTH should end
+        end_of_rth = self.start_frame + rth_duration
+
+        # Add a new storyboard entry with the given formation
+        storyboard.add_new_entry(
+            formation=create_formation("Return to home", target),
+            frame_start=end_of_rth,
+            duration=0,
+            select=True,
+            purpose=StoryboardEntryPurpose.LANDING,
+            context=context,
+        )
+
+        return True
+
+    def _run_smart_rth(
+        self,
+        storyboard: Storyboard,
+        *,
+        source: Sequence[Coordinate3D],
+        target: Sequence[Coordinate3D],
+        context: Context,
+    ) -> bool:
+        fps = context.scene.render.fps
+
+        # Set up non-trivial parameters
+        # TODO: get them as explicit parameter if needed
+        settings = getattr(context.scene.skybrush, "settings", None)
+        max_acceleration = settings.max_acceleration if settings else 4
+        to_aerial_grid = self._should_return_to_aerial_grid()
+        land_speed = min(self.velocity_z, 0.5)
+        land_duration = 0 if to_aerial_grid else self.altitude / land_speed
+
+        # call API to create smart RTH plan
+        eps = 2e-3
+        with call_api_from_blender_operator(self) as api:
+            plan = api.plan_smart_rth(
+                source,
+                target,
+                max_velocity_xy=self.velocity - eps,
+                max_velocity_z=self.velocity_z - eps,
+                max_acceleration=max_acceleration,
+                min_distance=self.spacing,
+                rth_model="straight_line_with_neck_to_layers"
+                if to_aerial_grid
+                else "straight_line_with_neck",
+            )
+        if not plan.start_times or not plan.durations:
+            return False
+
+        # Add a new storyboard entry for the smart RTH formation
+        # TODO: What should happen if there is already a formation with the
+        # same name?
+        entry = storyboard.add_new_entry(
+            formation=create_formation("Smart return to home", source),
+            frame_start=self.start_frame,
+            duration=int(ceil((plan.duration + land_duration) * fps)),
+            select=True,
+            purpose=StoryboardEntryPurpose.LANDING,
+            context=context,
+        )
+        assert entry is not None
+        markers = get_markers_from_formation(entry.formation)
+
+        # ensure clean animation data for all markers
+        for marker in markers:
+            assert isinstance(marker, Object)
+            ensure_animation_data_exists_for_object(marker, clean=True)
+
+        # generate smart RTH trajectories in the new formation
+        for start_time, duration, inner_points, p, q, marker in zip(
+            plan.start_times,
+            plan.durations,
+            plan.inner_points,
+            source,
+            target,
+            markers,
+            strict=True,
+        ):
+            f_curves = []
+            for i in range(3):
+                f_curve = ensure_f_curve_exists_for_data_path_and_index(
+                    marker, data_path="location", index=i
+                )
+                f_curves.append(f_curve)
+            insert = [
+                partial(f_curve.keyframe_points.insert, options={"FAST"})
+                for f_curve in f_curves
+            ]
+            path_points = []
+            if start_time > 0:
+                path_points.append((0, *p))
+            path_points.append((start_time, *p))
+            path_points.extend(tuple(inner_points))
+            path_points.append((start_time + duration, *q))
+            if not to_aerial_grid:
+                path_points.append(
+                    (
+                        start_time + duration + land_duration,
+                        q[0],
+                        q[1],
+                        0,  # TODO: starting position would be better than explicit 0
+                    )
+                )
+            for point in path_points:
+                frame = round(self.start_frame + point[0] * fps)
+                keyframes = (
+                    insert[0](frame, point[1]),
+                    insert[1](frame, point[2]),
+                    insert[2](frame, point[3]),
+                )
+                for keyframe in keyframes:
+                    keyframe.interpolation = "LINEAR"
+            # Commit the insertions that we've made in "fast" mode
+            for f_curve in f_curves:
+                f_curve.update()
+
+        return True
+
+    def _validate_start_frame(self, context: Context) -> bool:
+        """Returns whether the return to home time chosen by the user is valid."""
+        storyboard = get_storyboard(context=context)
+        last_frame = storyboard.frame_end if storyboard.last_entry is not None else None
+
+        # TODO(ntamas): what if the last entry in the storyboard _is_ the
+        # RTH, what shall we do then? Probably we should ignore it and look
+        # at the penultimate entry.
+
+        if last_frame is not None and self.start_frame < last_frame:
+            self.report(
+                {"ERROR"},
+                f"Return to home maneuver must not start before the last entry "
+                f"of the storyboard (frame {last_frame})",
+            )
+            return False
+
+        return True

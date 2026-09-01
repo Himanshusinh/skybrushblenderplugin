@@ -1,0 +1,26 @@
+[version]
+current = "5.0.0"
+regex = '''
+  (?P<major>\d+)
+  \.
+  (?P<minor>\d+)
+  \.
+  (?P<patch>\d+)
+  '''
+
+[git]
+message_template = "chore: bumped version to {new_version}"
+tag_template = "{new_version}"
+
+[[file]]
+src = "pyproject.toml"
+search = 'version = "{current_version}"'
+
+[[file]]
+src = "src/addons/ui_skybrush_studio.py"
+version_template = "({major}, {minor}, {patch})"
+search = '"version": {current_version}'
+
+[[before_commit]]
+name = "Run pre-commit hooks"
+cmd = "uv sync && prek run --all-files"
