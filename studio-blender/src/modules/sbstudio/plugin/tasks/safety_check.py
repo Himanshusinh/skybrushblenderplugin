@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import bpy
 from bpy.types import Collection
 
+from sbstudio.math.derivatives import estimate_second_derivative
 from sbstudio.math.nearest_neighbors import find_nearest_neighbors
 from sbstudio.model.types import Coordinate3D
 from sbstudio.plugin.constants import Collections
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 __all__ = (
     "SafetyCheckTask",
     "create_position_snapshot_for_drones_in_collection",
+    "estimate_accelerations_at_frame",
     "suspended_safety_checks",
     "invalidate_caches",
 )
@@ -42,17 +44,21 @@ PositionSnapshot = VectorSnapshot
 VelocitySnapshot = VectorSnapshot
 RotationSnapshot = VectorSnapshot
 
-_position_snapshot_cache: LRUCache[int, PositionSnapshot] = LRUCache(5)
+_position_snapshot_cache: LRUCache[int, PositionSnapshot] = LRUCache(9)
 """Cache that stores the positions in the last few frames visited by the user
-in the hope that we can estimate the velocities from it in the current frame.
+in the hope that we can estimate the velocities and accelerations from it in the
+current frame.
+
+Estimating accelerations needs positions from two frames on the same side of the
+current one, so this cache has to be deeper than the others.
 """
 
-_velocity_snapshot_cache: LRUCache[int, PositionSnapshot] = LRUCache(5)
-"""Cache that stores the velocities in the last few frames visited by the user
-in the hope that we can estimate the accelerations from it in the current frame.
+_MAX_ACCELERATION_FRAME_STEP = 2
+"""Largest frame spacing accepted when estimating accelerations.
 
-Velocities are estimated from the positions so this cache is probably even more
-sparsely populated than the position cache.
+A wider spacing averages the acceleration over a longer stretch of the
+trajectory, which would mask the very short spikes that this check exists to
+find, so we widen it only once before reporting that we do not know.
 """
 
 _rotation_snapshot_cache: LRUCache[int, RotationSnapshot] = LRUCache(5)
@@ -158,6 +164,42 @@ def estimate_derivatives_at_frame(
     return result, should_cache
 
 
+def estimate_accelerations_at_frame(
+    snapshot: PositionSnapshot,
+    cache: Mapping[int, PositionSnapshot],
+    *,
+    frame: int,
+    scene: Scene,
+) -> tuple[VectorSnapshot, bool]:
+    """Attempts to estimate the accelerations of the drones in the given frame
+    as a second difference of their positions in evenly spaced frames.
+
+    Note that the accelerations come from the positions and not from the
+    velocities estimated by :func:`estimate_derivatives_at_frame`; see
+    :func:`estimate_second_derivative` for why that matters.
+
+    While the user steps through the timeline forwards, the frames after the
+    current one have not been visited yet, so the estimate is one-sided and
+    therefore describes the acceleration a frame or two earlier.
+
+    Returns:
+        the estimates of the accelerations in the given frame, and whether they
+        could be estimated at all. An all-zero result reported with ``False``
+        means "unknown", not "not accelerating".
+    """
+    if frame <= scene.frame_start:
+        # Nothing has started moving yet at the very start of the scene
+        return dict.fromkeys(snapshot, _ZERO), True
+
+    return estimate_second_derivative(
+        snapshot,
+        cache,
+        index=frame,
+        step_size=1.0 / scene.render.fps,
+        max_step=_MAX_ACCELERATION_FRAME_STEP,
+    )
+
+
 @suspension.wrap
 def run_safety_check(scene: Scene, depsgraph: Depsgraph) -> None:
     safety_check = scene.skybrush.safety_check
@@ -208,12 +250,13 @@ def run_safety_check(scene: Scene, depsgraph: Depsgraph) -> None:
     velocity_snapshot, velocity_snapshot_valid = estimate_derivatives_at_frame(
         position_snapshot, _position_snapshot_cache, frame=frame, scene=scene
     )
-    if velocity_snapshot_valid:
-        _velocity_snapshot_cache[frame] = velocity_snapshot
 
-    # Prepare acceleration snapshot
-    acceleration_snapshot, acceleration_snapshot_valid = estimate_derivatives_at_frame(
-        velocity_snapshot, _velocity_snapshot_cache, frame=frame, scene=scene
+    # Prepare acceleration snapshot. This works on the positions rather than on
+    # the velocity estimates above on purpose; see the function for the reason.
+    acceleration_snapshot, acceleration_snapshot_valid = (
+        estimate_accelerations_at_frame(
+            position_snapshot, _position_snapshot_cache, frame=frame, scene=scene
+        )
     )
 
     # Prepare rotation and rotation rate snapshots
@@ -368,9 +411,8 @@ def invalidate_caches(clear_result: bool = False):
     This function should be called when the plugin makes radical changes to the
     current scene; for instance, after re-planning transitions.
     """
-    global _position_snapshot_cache, _velocity_snapshot_cache, _rotation_snapshot_cache
+    global _position_snapshot_cache, _rotation_snapshot_cache
     _position_snapshot_cache.clear()
-    _velocity_snapshot_cache.clear()
     _rotation_snapshot_cache.clear()
 
     if clear_result:

@@ -3,7 +3,7 @@ from math import ceil, inf
 from typing import Sequence
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Context
 
 from sbstudio.api import SkybrushStudioAPI
@@ -41,6 +41,33 @@ __all__ = ("TakeoffOperator",)
 
 log = logging.getLogger(__name__)
 
+_SMOOTH_PEAK_VELOCITY_FACTOR = 1.5
+"""Ratio of the peak to the average velocity of a smooth transition.
+
+The influence curve of a smooth transition is a cubic Bezier whose handles sit
+one third of the way into the interval, which reduces to ``3t^2 - 2t^3``. Its
+first derivative peaks at 1.5 halfway through the transition.
+"""
+
+_SMOOTH_PEAK_ACCELERATION_FACTOR = 6.0
+"""Largest absolute value of the second derivative of ``3t^2 - 2t^3``, reached
+at both ends of a smooth transition. Multiply by ``distance / duration ** 2``
+to obtain the peak acceleration of the maneuver.
+"""
+
+_PROFILE_AFTER_TAKEOFF = {
+    # A takeoff that ends at a standstill must be followed by a transition that
+    # also departs from a standstill, and one that ends at full climb velocity
+    # by a transition that picks that velocity up ("smooth from right" is smooth
+    # at its right end only). Pairing them the other way around puts a step in
+    # the velocity right where the takeoff ends.
+    "SMOOTH": "SMOOTH",
+    "LINEAR": "SMOOTH_FROM_RIGHT",
+}
+"""Velocity profile that the storyboard entry following the takeoff needs in
+order to keep the velocity continuous, keyed by the profile of the takeoff.
+"""
+
 
 def use_custom_spacing_updated(self, context: Context):
     """Called when the use_custom_spacing checkbox is enabled or disabled by the user."""
@@ -66,12 +93,47 @@ class TakeoffOperator(StoryboardOperator):
 
     velocity = FloatProperty(
         name="with Velocity",
-        description="Average vertical velocity during the takeoff maneuver",
+        description=(
+            "Average vertical velocity during the takeoff maneuver. This is "
+            "what sets the duration of the maneuver; with a smooth velocity "
+            "profile the drones briefly climb faster than this in the middle "
+            "of the maneuver"
+        ),
         default=1.5,
         min=0.1,
         soft_min=0.1,
         soft_max=10,
         unit="VELOCITY",
+    )
+
+    velocity_profile = EnumProperty(
+        name="Velocity Profile",
+        description=(
+            "Shape of the vertical velocity curve during the takeoff maneuver"
+        ),
+        items=[
+            (
+                "SMOOTH",
+                "Smooth",
+                (
+                    "Ramp the climb velocity up from a standstill and back down "
+                    "to a hover, keeping the acceleration bounded. Recommended"
+                ),
+                1,
+            ),
+            (
+                "LINEAR",
+                "Constant velocity",
+                (
+                    "Climb at a constant velocity, which means the drones reach "
+                    "and leave that velocity instantaneously. Only safe when the "
+                    "next transition starts exactly where the takeoff ends and "
+                    "carries the same velocity onwards"
+                ),
+                2,
+            ),
+        ],
+        default="SMOOTH",
     )
 
     altitude = FloatProperty(
@@ -145,7 +207,22 @@ class TakeoffOperator(StoryboardOperator):
 
         layout.prop(self, "start_frame")
         layout.prop(self, "velocity")
+        layout.prop(self, "velocity_profile")
         layout.prop(self, "altitude")
+
+        peak_velocity, peak_acceleration = self._estimate_peaks()
+        col = layout.column(align=True)
+        col.label(text=f"Peak climb velocity: {peak_velocity:.1f} m/s")
+        if peak_acceleration is None:
+            col.label(text="Peak acceleration: unbounded", icon="ERROR")
+        else:
+            settings = getattr(context.scene.skybrush, "settings", None)
+            preferred = settings.max_acceleration if settings else 4
+            row = col.row()
+            if peak_acceleration > preferred:
+                row.alert = True
+            row.label(text=f"Peak acceleration: {peak_acceleration:.1f} m/s\u00b2")
+
         row = layout.row()
         row.prop(self, "altitude_shift")
         if self.altitude_shift < self.spacing:
@@ -283,7 +360,8 @@ class TakeoffOperator(StoryboardOperator):
             )
         assert entry is not None
         entry.transition_type = "MANUAL"
-        entry.transition_velocity_profile = "LINEAR"
+        entry.transition_velocity_profile = self.velocity_profile
+        self._match_profile_of_entry_after_takeoff(storyboard)
 
         # Set up the custom departure delays for the drones
         if delays and max(delays) > 0:
@@ -311,10 +389,57 @@ class TakeoffOperator(StoryboardOperator):
                 with call_api_from_blender_operator(self, "transition planner"):
                     recalculate_transitions(tasks, start_of_scene=start_of_scene)
             except Exception as ex:
-                log.info(f"Server connection failed ({ex}); calculating transitions locally.")
+                log.info(
+                    f"Server connection failed ({ex}); calculating transitions locally."
+                )
                 recalculate_transitions(tasks, start_of_scene=start_of_scene)
 
         return True
+
+    def _estimate_peaks(self) -> tuple[float, float | None]:
+        """Estimates the peak vertical velocity and acceleration of the takeoff.
+
+        Returns:
+            the peak climb velocity in m/s, and the peak acceleration in m/s^2.
+            The latter is ``None`` for the constant-velocity profile, where the
+            drones start and stop climbing within a single frame and the
+            acceleration is therefore limited only by the frame rate.
+        """
+        if self.velocity_profile == "LINEAR":
+            return self.velocity, None
+
+        # Drones assigned to a higher takeoff layer climb further, but they are
+        # given proportionally more time so that everyone arrives together, so
+        # they accelerate more gently. The lowest layer, which climbs by
+        # `altitude`, is therefore the worst case.
+        distance = max(self.altitude, 1e-3)
+        duration = distance / self.velocity
+        return (
+            _SMOOTH_PEAK_VELOCITY_FACTOR * self.velocity,
+            _SMOOTH_PEAK_ACCELERATION_FACTOR * distance / (duration * duration),
+        )
+
+    def _match_profile_of_entry_after_takeoff(self, storyboard: Storyboard) -> None:
+        """Updates the velocity profile of the storyboard entry that follows the
+        takeoff so that the velocity stays continuous where the two meet.
+
+        Only the profile that used to pair with the other takeoff profile is
+        replaced, so a profile that the user picked deliberately is left alone.
+        """
+        entries = storyboard.entries
+        if len(entries) <= 2:
+            return
+
+        wanted = _PROFILE_AFTER_TAKEOFF[self.velocity_profile]
+        stale = {
+            profile
+            for takeoff_profile, profile in _PROFILE_AFTER_TAKEOFF.items()
+            if takeoff_profile != self.velocity_profile
+        }
+
+        entry = entries[2]
+        if entry.transition_velocity_profile in stale:
+            entry.transition_velocity_profile = wanted
 
     def _get_valid_range_for_start_frame(self, context: Context) -> tuple[float, float]:
         """Returns the interval that must contain the start frame of the takeoff
