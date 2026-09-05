@@ -128,9 +128,13 @@ class LightEffectUpdateSession:
             clear_base_color_cache_at_end = False
 
         if state is None:
-            # No color updates were applied and it has been like this even in the
-            # previous frame so no need to calculate the final colors
-            return LightEffectUpdate.NOP
+            # No light effect ran this frame. The drones still have LED colors
+            # on them (Apply Colors writes object-color keyframes), so expose
+            # those instead of returning NOP — export used to sample white.
+            drones = Collections.find_drones().objects
+            colors = self._owner._create_mutable_color_array_for_drones(drones)
+            self._final_colors = colors
+            return LightEffectUpdate(drones, ObjectPositions(drones), colors, False)
 
         self._final_colors = state.backdrop
         if clear_base_color_cache_at_end:

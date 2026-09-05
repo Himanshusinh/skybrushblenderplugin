@@ -3,18 +3,13 @@ from numpy import empty, float32
 from numpy.typing import NDArray
 
 from sbstudio.model.types import RGBAColor
-from sbstudio.plugin.colors import get_colors_of_drones_fast
+from sbstudio.plugin.colors import get_color_of_drone, get_colors_of_drones_fast
 from sbstudio.plugin.model.light_effects import LightEffectUpdate
 from sbstudio.utils import measure_time
 
 from .session import LightEffectUpdateSession
 
 __all__ = ("LightEffectUpdater",)
-
-WHITE: RGBAColor = (1, 1, 1, 1)
-"""White color, used as a base color when no info is available for a newly added
-drone.
-"""
 
 
 class LightEffectUpdater:
@@ -64,22 +59,22 @@ class LightEffectUpdater:
         idx = self._drone_to_row_index.get(drone)
         if idx is not None:
             return tuple(self._base_colors[idx])
-        return WHITE
+        return get_color_of_drone(drone)
 
     def get_final_color_of_drone(self, drone: Object) -> RGBAColor:
         """Returns the (cached) final color of the drone at the current frame
         after all active light effects are applied on it.
+
+        When no light effect has been evaluated for this frame the cache is
+        empty; fall back to the drone's own object color, which is where Apply
+        Colors stores the LED keyframes. Returning white here used to export
+        and display a blank show even though every drone already had a color.
         """
         idx = self._drone_to_row_index.get(drone)
-        if idx is None:
-            return WHITE
-
         final_colors = self._session._final_colors
-        return (
-            tuple(final_colors[idx])
-            if final_colors is not None
-            else tuple(self._base_colors[idx])
-        )
+        if idx is not None and final_colors is not None:
+            return tuple(final_colors[idx])
+        return get_color_of_drone(drone)
 
     def update(self, scene: Scene) -> LightEffectUpdate:
         """Updates the colors of the drones in the given scene based on the active
@@ -96,6 +91,7 @@ class LightEffectUpdater:
         if not light_effects or not light_effects.enabled:
             self._ensure_session_not_running()
             self._session.reset()
+            self._clear_base_colors()
             return LightEffectUpdate.NOP
 
         frame = scene.frame_current

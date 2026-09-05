@@ -4,6 +4,7 @@ from sbstudio.plugin.migrations import get_migration_details
 from sbstudio.plugin.model.formation import count_markers_in_formation
 from sbstudio.plugin.model.led_control import (
     get_expected_3d_viewport_shader_configuration_from_context,
+    set_expected_3d_viewport_shader_configuration_of_context,
 )
 from sbstudio.plugin.stats import get_drone_count
 from sbstudio.plugin.views import find_current_3d_view
@@ -57,6 +58,9 @@ def get_bad_shader_color_source_warning(context: Context) -> str | None:
 
 def draw_bad_shader_color_source_warning(context: Context, layout: UILayout) -> None:
     """Draw a bad shader color source warning to a layout, if needed."""
+    # Solid view hides per-drone LED colors unless shading is Object Color.
+    # Apply that setting here so the warning does not sit unread.
+    set_expected_3d_viewport_shader_configuration_of_context(context)
     label = get_bad_shader_color_source_warning(context)
     if label:
         _draw_warning(layout, text=label)

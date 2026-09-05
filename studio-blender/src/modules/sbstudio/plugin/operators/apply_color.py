@@ -97,6 +97,14 @@ class ApplyColorsToSelectedDronesOperator(Operator):
             ratio = index / (num_selected - 1) if num_selected > 1 else 0.5
             self._apply_color_to_single_drone(drone, frame, index, ratio)
 
+        # Solid view only shows per-drone LEDs when shading reads Object Color.
+        from sbstudio.plugin.model.led_control import (
+            set_expected_3d_viewport_shader_configuration_of_context,
+        )
+        from sbstudio.plugin.views import redraw_all_3d_views
+
+        set_expected_3d_viewport_shader_configuration_of_context(context)
+        redraw_all_3d_views()
         return True
 
     def _sort_selection(self, selection, context):

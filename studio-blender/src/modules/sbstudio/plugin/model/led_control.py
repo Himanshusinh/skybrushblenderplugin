@@ -40,21 +40,15 @@ def _visualization_callback_for_markers(update: LightEffectUpdate) -> None:
 
 
 def _visualization_callback_for_materials(update: LightEffectUpdate) -> None:
-    if not update.has_active_effects:
+    # Always push colors onto the drones. Skipping this when no light effect
+    # is active left keyframed LED colors stuck behind a viewport that does
+    # not read object.color (and export then sampled white from an empty cache).
+    drones, colors = update.get_drones_and_colors()
+    if not len(drones):
         return
 
-    if update.drones is None or update.colors is None:
-        return
-
-    # Slower method:
-    # for drone, color in zip(update.drones, update.colors, strict=True):
-    #     set_color_of_drone(drone, color)
-    #
-    # I expected the fast solution to be significantly faster, but this does not
-    # seem to be the case. But it is not slower either.
-
-    set_colors_of_drones_fast(update.drones, update.colors.ravel())
-    for drone in update.drones:
+    set_colors_of_drones_fast(drones, colors.ravel())
+    for drone in drones:
         drone.update_tag()
 
 
@@ -124,6 +118,21 @@ def get_overlay(create: bool = True):
     return _overlay
 
 
+def _apply_led_shader_configuration(
+    shading,
+    expected_wireframe_color_type: str | None,
+    expected_color_type: str | None,
+) -> None:
+    """Writes the LED color shading settings onto a single 3D view."""
+    match shading.type:
+        case "WIREFRAME":
+            if expected_wireframe_color_type is not None:
+                shading.wireframe_color_type = expected_wireframe_color_type
+        case "SOLID":
+            if expected_color_type is not None:
+                shading.color_type = expected_color_type
+
+
 def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -> None:
     """Updates the 3D viewport shading settings based on the current Blender
     context to use the expected wireframe and object color type.
@@ -134,17 +143,35 @@ def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -
     expected_wireframe_color_type, expected_color_type = (
         get_expected_3d_viewport_shader_configuration_from_context(context)
     )
+    if expected_wireframe_color_type is None and expected_color_type is None:
+        return
+
+    seen: set[int] = set()
+
+    def apply_space(space) -> None:
+        key = id(space)
+        if key in seen:
+            return
+        seen.add(key)
+        _apply_led_shader_configuration(
+            space.shading, expected_wireframe_color_type, expected_color_type
+        )
 
     for space in find_all_3d_views():
-        shading = space.shading
+        apply_space(space)
 
-        match shading.type:
-            case "WIREFRAME":
-                if expected_wireframe_color_type is not None:
-                    shading.wireframe_color_type = expected_wireframe_color_type
-            case "SOLID":
-                if expected_color_type is not None:
-                    shading.color_type = expected_color_type
+    # load_post and extra workspaces are not always on the current screen.
+    if context.window_manager is not None:
+        for window in context.window_manager.windows:
+            screen = window.screen
+            if screen is None:
+                continue
+            for area in screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        apply_space(space)
 
 
 def visualization_updated(
@@ -232,15 +259,20 @@ class LEDControlPanelProperties(PropertyGroup):
 
 @persistent
 def _on_load_initialize_callbacks(*args):
-    scene = bpy.context.scene
-    if hasattr(scene, "skybrush") and hasattr(scene.skybrush, "led_control"):
-        visualization_updated(scene.skybrush.led_control)
+    scene = getattr(bpy.context, "scene", None)
+    if (
+        scene is not None
+        and hasattr(scene, "skybrush")
+        and hasattr(scene.skybrush, "led_control")
+    ):
+        visualization_updated(scene.skybrush.led_control, bpy.context)
 
 
 def register():
     """Registers LED control subsystem."""
     if _on_load_initialize_callbacks not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_initialize_callbacks)
+    _on_load_initialize_callbacks()
 
 
 def unregister():
