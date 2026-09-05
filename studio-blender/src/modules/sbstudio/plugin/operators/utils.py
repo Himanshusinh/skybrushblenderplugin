@@ -608,8 +608,8 @@ def _get_trajectories_and_lights(
         context=context,
     )
 
-    trajectories: dict[str, Trajectory]
-    lights: dict[str, LightProgram]
+    trajectories: dict[str, Trajectory] = {}
+    lights: dict[str, LightProgram] = {}
 
     if trajectory_fps == light_fps:
         # This is easy, we can iterate over the show once
@@ -677,7 +677,6 @@ def _get_trajectories_and_lights(
                     redraw=redraw,
                     simplify=True,
                     light_eps=light_eps,
-                    trajectory_eps=trajectory_eps,
                 )
 
     return trajectories, lights
@@ -723,9 +722,9 @@ def _get_trajectories_lights_and_yaw_setpoints(
         context=context,
     )
 
-    trajectories: dict[str, Trajectory]
-    lights: dict[str, LightProgram]
-    yaw_setpoints: dict[str, YawSetpointList]
+    trajectories: dict[str, Trajectory] = {}
+    lights: dict[str, LightProgram] = {}
+    yaw_setpoints: dict[str, YawSetpointList] = {}
 
     if trajectory_fps == light_fps:
         # This is easy, we can iterate over the show once
@@ -802,7 +801,6 @@ def _get_trajectories_lights_and_yaw_setpoints(
                     redraw=redraw,
                     simplify=True,
                     light_eps=light_eps,
-                    trajectory_eps=trajectory_eps,
                 )
 
     return trajectories, lights, yaw_setpoints
@@ -824,9 +822,11 @@ def _report_progress_on_console(title: str = "") -> Iterator[ProgressHandler]:
     except (KeyboardInterrupt, TaskCancelled):
         print("Operation cancelled by user.")
         failed = True
+        raise
     except Exception as ex:
         print(f"Operation failed: {ex}")
         failed = True
+        raise
     finally:
         print(f"{title}: {'failed' if failed else 'done'}.")
 
