@@ -109,9 +109,8 @@ class SafetyCheckPanel(Panel):
         row.enabled = safety_check.acceleration_warning_enabled
 
         # Existing shows keep Linear (constant-speed) F-curves until they are
-        # rebuilt. Recalculate with scope ALL is what actually writes the
-        # rest-to-rest curves and lengthens gaps that cannot hold the preferred
-        # acceleration; changing the dropdown alone does not.
+        # rebuilt. Recalculate with scope ALL writes rest-to-rest curves on
+        # the existing gaps; it does not move storyboard frames.
         row = col.row()
         row.alert = bool(safety_check.should_show_acceleration_warning)
         props = row.operator(

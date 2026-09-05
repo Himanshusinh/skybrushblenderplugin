@@ -3,7 +3,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from math import ceil, inf
+from math import inf
 from typing import cast
 
 import bpy
@@ -15,10 +15,8 @@ from sbstudio.api.types import Mapping
 from sbstudio.errors import SkybrushStudioError
 from sbstudio.math.matching import match_points_locally
 from sbstudio.math.transition_timing import (
-    displacements_for_assignment,
     minimum_jerk,
     minimum_jerk_derivative,
-    required_transition_duration,
     wanted_transition_profile,
 )
 from sbstudio.plugin.actions import (
@@ -864,144 +862,17 @@ def prepare_show_transition_profiles(storyboard: Storyboard) -> int:
     return upgraded
 
 
-def _displacements_between_formations(
-    previous: StoryboardEntry, entry: StoryboardEntry
-) -> list[tuple[float, float, float]]:
-    """Hop vectors from the previous formation's markers to this one's.
-
-    Live drone positions are the wrong source: if the next constraint is
-    already blending, the drones are mid-transition and the hops look tiny,
-    so we would refuse to lengthen a gap that is in fact far too short.
-    """
-    if previous.formation is None or entry.formation is None:
-        return []
-
-    source = get_coordinates_of_formation(previous.formation, frame=previous.frame_end)
-    target = get_coordinates_of_formation(entry.formation, frame=entry.frame_start)
-    if not source or not target:
-        return []
-
-    if entry.transition_type == "MANUAL":
-        inverse: list[int | None] = [
-            index if index < len(source) else None for index in range(len(target))
-        ]
-    else:
-        inverse, _clearance = match_points_locally(source, target)
-
-    return displacements_for_assignment(source, target, inverse)
-
-
-def _transition_limits_from_scene(scene) -> dict[str, float]:
-    """Velocity and acceleration caps used when sizing a transition."""
-    safety = getattr(scene.skybrush, "safety_check", None)
-    settings = getattr(scene.skybrush, "settings", None)
-    return {
-        "max_velocity_xy": (safety.velocity_xy_warning_threshold if safety else 10),
-        "max_velocity_z_up": (
-            safety.effective_velocity_z_threshold_up if safety else 2
-        ),
-        "max_velocity_z_down": (
-            safety.effective_velocity_z_threshold_down if safety else 2
-        ),
-        "max_acceleration": settings.max_acceleration if settings else 4,
-    }
-
-
-def stretch_storyboard_transitions(
-    storyboard: Storyboard,
-    entry_indices: Iterable[int],
-    *,
-    scene,
-    get_positions_of,
-    drones,
-) -> int:
-    """Pushes storyboard entries later whenever the gap leading into them is
-    too short for the preferred velocity and acceleration.
-
-    Later entries shift by the same amount so their own durations and the
-    gaps between them stay as the user set them. Locked entries are not
-    moved as destinations (their incoming transition is left alone) but they
-    still ride along when an earlier unlocked entry has to move.
-
-    Returns:
-        the total number of frames added across every stretched transition
-    """
-    fps = scene.render.fps
-    limits = _transition_limits_from_scene(scene)
-    to_fix = set(entry_indices)
-    entries = storyboard.entries
-    total_extra = 0
-    cascade = 0
-
-    for index in range(len(entries)):
-        entry = entries[index]
-        if cascade:
-            entry.frame_start += cascade
-
-        if index == 0 or index not in to_fix or entry.is_locked:
-            continue
-        if entry.formation is None:
-            continue
-        # Takeoff already sizes itself from the climb velocity the user typed
-        # in. Re-planning it here would fight that number (a smooth climb
-        # peaks above the average, so the Z-velocity cap would keep stretching
-        # it).
-        if entry.purpose == "TAKEOFF":
-            continue
-
-        previous = entries[index - 1]
-        gap = entry.frame_start - previous.frame_end
-        hops = _displacements_between_formations(previous, entry)
-        if not hops and drones:
-            # Free segment or a formation without markers: fall back to
-            # wherever the drones actually are.
-            source = get_positions_of(drones, frame=previous.frame_end)
-            target = get_coordinates_of_formation(
-                entry.formation, frame=entry.frame_start
-            )
-            inverse, _clearance = match_points_locally(source, target)
-            hops = displacements_for_assignment(source, target, inverse)
-
-        seconds = required_transition_duration(
-            hops,
-            # Always size the gap for a rest-to-rest curve. A Linear profile
-            # has no finite acceleration; using it here would leave the gap
-            # short and keep the 0 → 28 m/s² flash.
-            profile="SMOOTH",
-            **limits,
-        )
-        needed = max(int(ceil(seconds * fps)), 1)
-        extra = needed - gap
-        if extra > 0:
-            entry.frame_start += extra
-            cascade += extra
-            total_extra += extra
-            log.info(
-                "Lengthened transition into %r by %s frames so it stays "
-                "within %.1f m/s²",
-                entry.name,
-                extra,
-                limits["max_acceleration"],
-            )
-
-    if cascade:
-        storyboard._regenerate_entries_or_transitions()
-
-    return total_extra
-
-
 def recalculate_transitions(
     tasks: Iterable[RecalculationTask], *, start_of_scene: int
-) -> tuple[int, int]:
+) -> int:
     drones = Collections.find_drones().objects
     if not drones:
-        return 0, 0
+        return 0
 
     tasks = list(tasks)
     scene = bpy.context.scene
     storyboard = getattr(scene.skybrush, "storyboard", None)
     upgraded = 0
-    extra_frames = 0
 
     # Mapping from drone indices to marker indices in the previous
     # formation, or ``None`` if this is not known for some reason. Possible
@@ -1015,21 +886,6 @@ def recalculate_transitions(
     with create_position_evaluator() as get_positions_of:
         if storyboard is not None:
             upgraded = prepare_show_transition_profiles(storyboard)
-            extra_frames = stretch_storyboard_transitions(
-                storyboard,
-                (task.entry_index for task in tasks),
-                scene=scene,
-                get_positions_of=get_positions_of,
-                drones=drones,
-            )
-            entries = storyboard.entries
-            count = len(entries)
-            for task in tasks:
-                task.start_frame_of_next_entry = (
-                    entries[task.entry_index + 1].frame_start
-                    if task.entry_index + 1 < count
-                    else None
-                )
 
         # Iterate through the entries for which we need to recalculate the
         # transitions
@@ -1054,7 +910,7 @@ def recalculate_transitions(
 
     bpy.ops.skybrush.fix_constraint_ordering()
     invalidate_caches(clear_result=True)
-    return upgraded, extra_frames
+    return upgraded
 
 
 class RecalculateTransitionsOperator(StoryboardOperator):
@@ -1064,9 +920,9 @@ class RecalculateTransitionsOperator(StoryboardOperator):
     bl_label = "Recalculate Transitions"
     bl_description = (
         "Recalculates all transitions in the show based on the current "
-        "storyboard. Transitions that are too short for the preferred "
-        "acceleration or the velocity limits are lengthened so the drones "
-        "do not have to start or stop instantaneously"
+        "storyboard. Shape-to-shape moves are given a rest-to-rest velocity "
+        "curve so acceleration no longer jumps on the first frame. The "
+        "storyboard timing is left as it is"
     )
     bl_options = {"UNDO"}
 
@@ -1135,11 +991,11 @@ class RecalculateTransitionsOperator(StoryboardOperator):
             return {"CANCELLED"}
 
         prefs = get_preferences()
-        stats = (0, 0)
+        upgraded = 0
         if not prefs.plan_transitions_locally:
             try:
                 with call_api_from_blender_operator(self, "transition planner"):
-                    stats = recalculate_transitions(
+                    upgraded = recalculate_transitions(
                         tasks, start_of_scene=start_of_scene
                     )
                 bpy.ops.skybrush.update_time_markers_from_storyboard()
@@ -1150,7 +1006,7 @@ class RecalculateTransitionsOperator(StoryboardOperator):
                 )
                 setattr(prefs, "plan_transitions_locally", True)
                 try:
-                    stats = recalculate_transitions(
+                    upgraded = recalculate_transitions(
                         tasks, start_of_scene=start_of_scene
                     )
                     bpy.ops.skybrush.update_time_markers_from_storyboard()
@@ -1158,25 +1014,15 @@ class RecalculateTransitionsOperator(StoryboardOperator):
                 except Exception:
                     success = False
         else:
-            stats = recalculate_transitions(tasks, start_of_scene=start_of_scene)
+            upgraded = recalculate_transitions(tasks, start_of_scene=start_of_scene)
             bpy.ops.skybrush.update_time_markers_from_storyboard()
             success = True
 
         if success:
-            upgraded, extra_frames = stats
-            parts: list[str] = []
-            if upgraded:
-                parts.append(f"set {upgraded} to Smooth")
-            if extra_frames:
-                parts.append(
-                    f"added {extra_frames} frames so accelerations stay bounded"
-                )
+            extra = f": set {upgraded} to Smooth" if upgraded else ""
             self.report(
                 {"INFO"},
-                "Recalculated transitions"
-                + (
-                    ": " + "; ".join(parts) if parts else " with a rest-to-rest profile"
-                ),
+                f"Recalculated transitions{extra} without changing frame counts",
             )
 
         return {"FINISHED"} if success else {"CANCELLED"}
