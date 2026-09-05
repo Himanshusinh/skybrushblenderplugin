@@ -47,6 +47,17 @@ def update_light_effects(scene: Scene, depsgraph: Depsgraph):
     if not color_update_callbacks_suspension.active:
         final_color_updated_callbacks(updates)
 
+    # Frame/depsgraph handlers may write RNA; this is what actually switches
+    # Solid view to Object Color so the ramp the user just set becomes visible.
+    try:
+        from sbstudio.plugin.model.led_control import (
+            set_expected_3d_viewport_shader_configuration_of_context,
+        )
+
+        set_expected_3d_viewport_shader_configuration_of_context(bpy.context)
+    except Exception:
+        pass
+
 
 def get_base_color_of_drone(drone: Object) -> RGBAColor:
     """Returns the (cached) base color of the drone at the current frame

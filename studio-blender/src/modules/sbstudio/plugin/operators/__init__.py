@@ -32,6 +32,7 @@ from .export_to_skyc import SkybrushExportOperator
 from .export_to_skyc_and_pdf import SkybrushSKYCAndPDFExportOperator
 from .export_to_vviz import VVIZExportOperator
 from .fix_constraint_ordering import FixConstraintOrderingOperator
+from .fix_viewport_led_shader import FixViewportLEDShaderOperator
 from .get_formation_stats import GetFormationStatisticsOperator
 from .import_light_effects import ImportLightEffectsOperator
 from .invalidate_light_effect_pixel_cache import (
@@ -115,6 +116,7 @@ __all__ = (
     "ExportLightEffectsOperator",
     "FinaleCSVExportOperator",
     "FixConstraintOrderingOperator",
+    "FixViewportLEDShaderOperator",
     "GetFormationStatisticsOperator",
     "ImportLightEffectsOperator",
     "InvalidateLightEffectPixelCacheOperator",

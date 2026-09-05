@@ -20,6 +20,7 @@ __all__ = (
     "LEDControlPanelProperties",
     "get_expected_3d_viewport_shader_configuration",
     "get_expected_3d_viewport_shader_configuration_from_context",
+    "schedule_viewport_led_shader_fix",
     "set_expected_3d_viewport_shader_configuration_of_context",
 )
 
@@ -124,13 +125,17 @@ def _apply_led_shader_configuration(
     expected_color_type: str | None,
 ) -> None:
     """Writes the LED color shading settings onto a single 3D view."""
-    match shading.type:
-        case "WIREFRAME":
-            if expected_wireframe_color_type is not None:
-                shading.wireframe_color_type = expected_wireframe_color_type
-        case "SOLID":
-            if expected_color_type is not None:
-                shading.color_type = expected_color_type
+    try:
+        match shading.type:
+            case "WIREFRAME":
+                if expected_wireframe_color_type is not None:
+                    shading.wireframe_color_type = expected_wireframe_color_type
+            case "SOLID":
+                if expected_color_type is not None:
+                    shading.color_type = expected_color_type
+    except Exception:
+        # Panel draw and some handlers cannot write RNA; the timer/operator retry.
+        pass
 
 
 def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -> None:
@@ -149,6 +154,8 @@ def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -
     seen: set[int] = set()
 
     def apply_space(space) -> None:
+        if space is None or getattr(space, "type", None) != "VIEW_3D":
+            return
         key = id(space)
         if key in seen:
             return
@@ -157,12 +164,12 @@ def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -
             space.shading, expected_wireframe_color_type, expected_color_type
         )
 
-    for space in find_all_3d_views():
-        apply_space(space)
+    # The view the user is looking at must be updated first.
+    apply_space(getattr(context, "space_data", None))
 
-    # load_post and extra workspaces are not always on the current screen.
-    if context.window_manager is not None:
-        for window in context.window_manager.windows:
+    window_manager = getattr(context, "window_manager", None)
+    if window_manager is not None:
+        for window in window_manager.windows:
             screen = window.screen
             if screen is None:
                 continue
@@ -170,8 +177,47 @@ def set_expected_3d_viewport_shader_configuration_of_context(context: Context) -
                 if area.type != "VIEW_3D":
                     continue
                 for space in area.spaces:
-                    if space.type == "VIEW_3D":
-                        apply_space(space)
+                    apply_space(space)
+
+    try:
+        for space in find_all_3d_views():
+            apply_space(space)
+    except Exception:
+        pass
+
+
+_pending_shader_fix = False
+
+
+def _run_scheduled_viewport_led_shader_fix() -> None:
+    global _pending_shader_fix
+    _pending_shader_fix = False
+    try:
+        set_expected_3d_viewport_shader_configuration_of_context(bpy.context)
+        from sbstudio.plugin.views import redraw_all_3d_views
+
+        redraw_all_3d_views()
+    except Exception:
+        pass
+    return None
+
+
+def schedule_viewport_led_shader_fix() -> None:
+    """Applies the LED viewport shader on the next timer tick.
+
+    Writing shading settings from ``Panel.draw()`` is ignored by Blender, which
+    is why the old warning stayed on screen even after the colors were set.
+    """
+    global _pending_shader_fix
+    if _pending_shader_fix:
+        return
+    _pending_shader_fix = True
+    try:
+        bpy.app.timers.register(
+            _run_scheduled_viewport_led_shader_fix, first_interval=0.01
+        )
+    except Exception:
+        _pending_shader_fix = False
 
 
 def visualization_updated(
@@ -200,6 +246,7 @@ def visualization_updated(
     # update viewport shading according to selection
     if context is not None:
         set_expected_3d_viewport_shader_configuration_of_context(context)
+        schedule_viewport_led_shader_fix()
 
 
 class LEDControlPanelProperties(PropertyGroup):
