@@ -10,6 +10,11 @@ faithfully instead of inventing spikes of its own.
 
 import pytest
 from sbstudio.math.derivatives import estimate_second_derivative
+from sbstudio.math.transition_timing import (
+    MIN_JERK_PEAK_ACCELERATION,
+    MIN_JERK_PEAK_VELOCITY,
+    minimum_jerk,
+)
 from sbstudio.utils import LRUCache
 
 FPS = 25
@@ -104,7 +109,7 @@ def test_smooth_trajectory_never_reports_a_spike_while_stepping_through_it():
     duration = int(seconds * FPS)
 
     def altitude_at(frame: int) -> float:
-        return height * _smoothstep(_clamp(frame / duration))
+        return height * minimum_jerk(_clamp(frame / duration))
 
     bound = SMOOTH_PEAK_ACCELERATION_FACTOR * height / seconds**2
     for frame in range(6, duration + 20):
@@ -130,11 +135,11 @@ def test_missing_neighbouring_frames_are_reported_as_unknown():
 # The velocity profile of the takeoff itself
 
 
-SMOOTH_PEAK_VELOCITY_FACTOR = 1.5
-SMOOTH_PEAK_ACCELERATION_FACTOR = 6.0
+SMOOTH_PEAK_VELOCITY_FACTOR = MIN_JERK_PEAK_VELOCITY
+SMOOTH_PEAK_ACCELERATION_FACTOR = MIN_JERK_PEAK_ACCELERATION
 """Copies of the factors that ``takeoff.py`` uses to predict the peaks of a
 smooth maneuver. ``test_smooth_transition_peaks_match_the_predicted_factors``
-checks them against the curve that Blender actually evaluates.
+checks them against the minimum-jerk polynomial the influence curve tracks.
 """
 
 
@@ -142,26 +147,16 @@ def _clamp(x: float) -> float:
     return min(max(x, 0.0), 1.0)
 
 
-def _smoothstep(x: float) -> float:
-    """Influence curve of a smooth transition.
-
-    Blender puts the handles of the Bezier a third of the way into the interval,
-    which makes the curve reduce to this polynomial.
-    """
-    return x * x * (3.0 - 2.0 * x)
-
-
 def _influence(profile: str, x: float) -> float:
-    return x if profile == "LINEAR" else _smoothstep(x)
+    return x if profile == "LINEAR" else minimum_jerk(x)
 
 
 def test_smooth_transition_peaks_match_the_predicted_factors():
     dx = 1e-5
-    # The curvature is largest at the two ends, so they have to be sampled too
     samples = [i / 1000 for i in range(1001)]
-    slopes = [(_smoothstep(x + dx) - _smoothstep(x - dx)) / (2 * dx) for x in samples]
+    slopes = [(minimum_jerk(x + dx) - minimum_jerk(x - dx)) / (2 * dx) for x in samples]
     curvatures = [
-        (_smoothstep(x + dx) - 2 * _smoothstep(x) + _smoothstep(x - dx)) / dx**2
+        (minimum_jerk(x + dx) - 2 * minimum_jerk(x) + minimum_jerk(x - dx)) / dx**2
         for x in samples
     ]
 
@@ -169,6 +164,11 @@ def test_smooth_transition_peaks_match_the_predicted_factors():
     assert max(abs(c) for c in curvatures) == pytest.approx(
         SMOOTH_PEAK_ACCELERATION_FACTOR, rel=1e-3
     )
+    # The whole point of the quintic: acceleration is zero at both ends, so a
+    # drone that was hovering does not jump to its peak acceleration in one
+    # frame the way a cubic smoothstep would.
+    assert curvatures[0] == pytest.approx(0.0, abs=1e-3)
+    assert curvatures[-1] == pytest.approx(0.0, abs=1e-3)
 
 
 @pytest.mark.parametrize("profile", ["LINEAR", "SMOOTH"])

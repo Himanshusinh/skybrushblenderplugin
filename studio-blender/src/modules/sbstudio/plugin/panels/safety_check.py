@@ -1,6 +1,7 @@
 from bpy.types import Context, Panel
 
 from sbstudio.plugin.operators import (
+    RecalculateTransitionsOperator,
     RunFullProximityCheckOperator,
     ValidateTrajectoriesOperator,
 )
@@ -106,6 +107,18 @@ class SafetyCheckPanel(Panel):
         row = col.row()
         row.prop(safety_check, "acceleration_warning_threshold", text="", slider=True)
         row.enabled = safety_check.acceleration_warning_enabled
+
+        # Existing shows keep Linear (constant-speed) F-curves until they are
+        # rebuilt. Recalculate with scope ALL is what actually writes the
+        # rest-to-rest curves and lengthens gaps that cannot hold the preferred
+        # acceleration; changing the dropdown alone does not.
+        row = col.row()
+        row.alert = bool(safety_check.should_show_acceleration_warning)
+        props = row.operator(
+            RecalculateTransitionsOperator.bl_idname,
+            text="Fix transition accelerations",
+        )
+        props.scope = "ALL"
 
         # Yaw rate warning widgets
 

@@ -12,6 +12,10 @@ from sbstudio.api.version import is_backend_version_at_least
 from sbstudio.errors import SkybrushStudioError
 from sbstudio.math.decomposition import decompose_points_locally
 from sbstudio.math.nearest_neighbors import find_nearest_neighbors
+from sbstudio.math.transition_timing import (
+    MIN_JERK_PEAK_ACCELERATION,
+    MIN_JERK_PEAK_VELOCITY,
+)
 from sbstudio.model.types import Coordinate3D
 from sbstudio.plugin.api import call_api_from_blender_operator, get_api
 from sbstudio.plugin.constants import Collections, Formations
@@ -41,18 +45,12 @@ __all__ = ("TakeoffOperator",)
 
 log = logging.getLogger(__name__)
 
-_SMOOTH_PEAK_VELOCITY_FACTOR = 1.5
-"""Ratio of the peak to the average velocity of a smooth transition.
+_SMOOTH_PEAK_VELOCITY_FACTOR = MIN_JERK_PEAK_VELOCITY
+"""Ratio of the peak to the average velocity of a smooth (minimum-jerk) takeoff."""
 
-The influence curve of a smooth transition is a cubic Bezier whose handles sit
-one third of the way into the interval, which reduces to ``3t^2 - 2t^3``. Its
-first derivative peaks at 1.5 halfway through the transition.
-"""
-
-_SMOOTH_PEAK_ACCELERATION_FACTOR = 6.0
-"""Largest absolute value of the second derivative of ``3t^2 - 2t^3``, reached
-at both ends of a smooth transition. Multiply by ``distance / duration ** 2``
-to obtain the peak acceleration of the maneuver.
+_SMOOTH_PEAK_ACCELERATION_FACTOR = MIN_JERK_PEAK_ACCELERATION
+"""Peak of the second derivative of the unit minimum-jerk polynomial. Multiply
+by ``distance / duration ** 2`` to obtain the peak acceleration of the maneuver.
 """
 
 _PROFILE_AFTER_TAKEOFF = {

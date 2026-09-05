@@ -2,6 +2,11 @@ from math import ceil
 
 from bpy.types import Collection, Context
 
+from sbstudio.math.matching import match_points_locally
+from sbstudio.math.transition_timing import (
+    displacements_for_assignment,
+    required_transition_duration,
+)
 from sbstudio.plugin.api import call_api_from_blender_operator
 from sbstudio.plugin.constants import Collections
 from sbstudio.plugin.model.formation import (
@@ -104,16 +109,25 @@ class AppendFormationToStoryboardOperator(FormationOperator):
             except Exception:
                 plan = None
 
-        duration = plan.total_duration if (plan and plan.durations) else 10.0
-        if plan is None and source and target:
-            try:
-                max_dist = max(
-                    ((s[0] - t[0]) ** 2 + (s[1] - t[1]) ** 2 + (s[2] - t[2]) ** 2) ** 0.5
-                    for s, t in zip(source, target[: len(source)])
-                ) if len(source) == len(target) else 30.0
-                duration = max(5.0, max_dist / 3.0 + 3.0)
-            except Exception:
-                duration = 10.0
+        duration = plan.total_duration if (plan and plan.durations) else None
+        if duration is None:
+            # Pair by the same assignment the transition will actually fly,
+            # not by index: a naive zip underestimates the longest hop and
+            # then the drones have to cover that hop in a gap that cannot
+            # hold the acceleration.
+            match, _clearance = match_points_locally(source, target)
+            duration = required_transition_duration(
+                displacements_for_assignment(source, target, match),
+                max_velocity_xy=safety_kwds["max_velocity_xy"],
+                max_velocity_z_up=(
+                    safety_kwds["max_velocity_z_up"]
+                    if safety_kwds["max_velocity_z_up"] is not None
+                    else safety_kwds["max_velocity_z"]
+                ),
+                max_velocity_z_down=safety_kwds["max_velocity_z"],
+                max_acceleration=safety_kwds["max_acceleration"],
+                profile=entry.transition_velocity_profile,
+            )
 
         # To get nicer-looking frame counts, we round the end of the
         # transition up to the next whole second. We need to take into account

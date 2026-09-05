@@ -105,6 +105,10 @@ class TransitionEditorBase(Panel):
 
         layout.prop(entry, "is_locked")
 
+        layout.label(
+            text="Fix transition accelerations (Safety panel) rebuilds every move"
+        )
+
         props: RecalculateTransitionsOperator = layout.operator(
             RecalculateTransitionsOperator.bl_idname, text="Recalculate"
         )

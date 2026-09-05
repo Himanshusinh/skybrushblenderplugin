@@ -1,8 +1,9 @@
+import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from math import inf
+from math import ceil, inf
 from typing import cast
 
 import bpy
@@ -13,6 +14,13 @@ from sbstudio.api.errors import SkybrushStudioAPIError
 from sbstudio.api.types import Mapping
 from sbstudio.errors import SkybrushStudioError
 from sbstudio.math.matching import match_points_locally
+from sbstudio.math.transition_timing import (
+    displacements_for_assignment,
+    minimum_jerk,
+    minimum_jerk_derivative,
+    required_transition_duration,
+    wanted_transition_profile,
+)
 from sbstudio.plugin.actions import (
     cleanup_actions_for_object,
     ensure_animation_data_exists_for_object,
@@ -39,6 +47,14 @@ from sbstudio.utils import constant
 from .base import StoryboardOperator
 
 __all__ = ("RecalculateTransitionsOperator",)
+
+log = logging.getLogger(__name__)
+
+_MIN_JERK_SEGMENTS = 4
+"""Cubic pieces used to track the minimum-jerk polynomial of a smooth
+transition. Four is enough for the sampled Hermite spline to stay close to the
+quintic, including a first and second derivative of zero at both ends.
+"""
 
 
 class InfluenceCurveTransitionType(Enum):
@@ -151,7 +167,32 @@ class InfluenceCurveDescriptor:
         # Ramp up to 1 at the start frame
         frame = max(self.start_frame, keyframes[-1][0] + 1)
         start_of_transition = len(keyframes) - 1
-        keyframes.append((frame, 1.0))
+        if (
+            self.windup_type == InfluenceCurveTransitionType.SMOOTH
+            and frame - keyframes[-1][0] >= 3
+        ):
+            # A single cubic Bezier that starts and ends at rest has its peak
+            # acceleration on the very first and last frame, so a drone that was
+            # hovering jumps from 0 to 6d/T² in one sample. Sample the
+            # minimum-jerk quintic instead: that polynomial is at rest *and*
+            # unaccelerated at both ends, so the acceleration ramps up over a
+            # fifth of the transition instead of appearing all at once.
+            t0 = keyframes[-1][0]
+            span = frame - t0
+            segments = min(_MIN_JERK_SEGMENTS, max(2, span // 2))
+            last = t0
+            for i in range(1, segments + 1):
+                sample = round(t0 + i / segments * span)
+                if sample <= last:
+                    continue
+                keyframes.append((sample, minimum_jerk(i / segments)))
+                last = sample
+            if keyframes[-1][0] != frame:
+                keyframes.append((frame, 1.0))
+            else:
+                keyframes[-1] = (frame, 1.0)
+        else:
+            keyframes.append((frame, 1.0))
         end_of_transition = len(keyframes) - 1
 
         # Add a keyframe at the end frame
@@ -166,15 +207,25 @@ class InfluenceCurveDescriptor:
             # have to be adjusted
             # keyframes.append((end_frame + 1, 0.0))
 
+        interpolation = (
+            "BEZIER"
+            if self.windup_type == InfluenceCurveTransitionType.SMOOTH
+            else "LINEAR"
+        )
         keyframe_objs = set_keyframes(
             object,
             data_path,
             keyframes,
             clear_range=(None, inf),
-            interpolation="LINEAR",
+            interpolation=interpolation,
         )
 
-        if self.windup_type != InfluenceCurveTransitionType.LINEAR:
+        if self.windup_type == InfluenceCurveTransitionType.SMOOTH:
+            _apply_minimum_jerk_handles(
+                keyframe_objs[start_of_transition : end_of_transition + 1]
+            )
+            update_fcurves(object, data_path)
+        elif self.windup_type != InfluenceCurveTransitionType.LINEAR:
             kf_start = keyframe_objs[start_of_transition]
             kf_start.interpolation = "BEZIER"
             if self.windup_type == InfluenceCurveTransitionType.SMOOTH_FROM_RIGHT:
@@ -184,6 +235,37 @@ class InfluenceCurveDescriptor:
                 kf_end = keyframe_objs[end_of_transition]
                 kf_end.handle_left_type = "VECTOR"
                 update_fcurves(object, data_path)
+
+
+def _apply_minimum_jerk_handles(keyframes) -> None:
+    """Gives the sampled minimum-jerk keyframes Hermite handles that match the
+    quintic's derivative, so each cubic piece starts and ends at the right
+    slope. ``set_keyframes`` flattens every handle, which would otherwise stop
+    the drone at every sample.
+    """
+    if len(keyframes) < 2:
+        return
+
+    t0 = keyframes[0].co[0]
+    span = keyframes[-1].co[0] - t0
+    if span <= 0:
+        return
+
+    handle = max(span / (3 * (len(keyframes) - 1)), 0.5)
+    for keyframe in keyframes:
+        tau = (keyframe.co[0] - t0) / span
+        slope = minimum_jerk_derivative(tau) / span
+        keyframe.interpolation = "BEZIER"
+        keyframe.handle_left_type = "FREE"
+        keyframe.handle_right_type = "FREE"
+        keyframe.handle_left = (
+            keyframe.co[0] - handle,
+            keyframe.co[1] - slope * handle,
+        )
+        keyframe.handle_right = (
+            keyframe.co[0] + handle,
+            keyframe.co[1] + slope * handle,
+        )
 
 
 class _LazyFormationTargetList:
@@ -749,12 +831,177 @@ class RecalculationTask:
         )
 
 
+def prepare_show_transition_profiles(storyboard: Storyboard) -> int:
+    """Puts every show-to-show transition on a rest-to-rest Smooth profile.
+
+    Existing shows often still have Linear (constant-velocity) transitions.
+    Those reach cruise speed in a single frame, which is exactly the
+    0 → 28 m/s² flash on the overlay. Recalculating without changing the
+    profile would just write the same linear F-curve again.
+
+    A Linear takeoff is left alone; the show entry that follows it is set to
+    Smooth from right so the climb velocity is handed off instead of killed.
+    """
+    upgraded = 0
+    entries = storyboard.entries
+    for index, entry in enumerate(entries):
+        if index == 0 or entry.purpose == "TAKEOFF":
+            continue
+
+        previous = entries[index - 1]
+        wanted = wanted_transition_profile(
+            previous_purpose=previous.purpose,
+            previous_profile=previous.transition_velocity_profile,
+            purpose=entry.purpose,
+        )
+        if wanted is None:
+            continue
+
+        if entry.transition_velocity_profile != wanted:
+            entry.transition_velocity_profile = wanted
+            upgraded += 1
+
+    return upgraded
+
+
+def _displacements_between_formations(
+    previous: StoryboardEntry, entry: StoryboardEntry
+) -> list[tuple[float, float, float]]:
+    """Hop vectors from the previous formation's markers to this one's.
+
+    Live drone positions are the wrong source: if the next constraint is
+    already blending, the drones are mid-transition and the hops look tiny,
+    so we would refuse to lengthen a gap that is in fact far too short.
+    """
+    if previous.formation is None or entry.formation is None:
+        return []
+
+    source = get_coordinates_of_formation(previous.formation, frame=previous.frame_end)
+    target = get_coordinates_of_formation(entry.formation, frame=entry.frame_start)
+    if not source or not target:
+        return []
+
+    if entry.transition_type == "MANUAL":
+        inverse: list[int | None] = [
+            index if index < len(source) else None for index in range(len(target))
+        ]
+    else:
+        inverse, _clearance = match_points_locally(source, target)
+
+    return displacements_for_assignment(source, target, inverse)
+
+
+def _transition_limits_from_scene(scene) -> dict[str, float]:
+    """Velocity and acceleration caps used when sizing a transition."""
+    safety = getattr(scene.skybrush, "safety_check", None)
+    settings = getattr(scene.skybrush, "settings", None)
+    return {
+        "max_velocity_xy": (safety.velocity_xy_warning_threshold if safety else 10),
+        "max_velocity_z_up": (
+            safety.effective_velocity_z_threshold_up if safety else 2
+        ),
+        "max_velocity_z_down": (
+            safety.effective_velocity_z_threshold_down if safety else 2
+        ),
+        "max_acceleration": settings.max_acceleration if settings else 4,
+    }
+
+
+def stretch_storyboard_transitions(
+    storyboard: Storyboard,
+    entry_indices: Iterable[int],
+    *,
+    scene,
+    get_positions_of,
+    drones,
+) -> int:
+    """Pushes storyboard entries later whenever the gap leading into them is
+    too short for the preferred velocity and acceleration.
+
+    Later entries shift by the same amount so their own durations and the
+    gaps between them stay as the user set them. Locked entries are not
+    moved as destinations (their incoming transition is left alone) but they
+    still ride along when an earlier unlocked entry has to move.
+
+    Returns:
+        the total number of frames added across every stretched transition
+    """
+    fps = scene.render.fps
+    limits = _transition_limits_from_scene(scene)
+    to_fix = set(entry_indices)
+    entries = storyboard.entries
+    total_extra = 0
+    cascade = 0
+
+    for index in range(len(entries)):
+        entry = entries[index]
+        if cascade:
+            entry.frame_start += cascade
+
+        if index == 0 or index not in to_fix or entry.is_locked:
+            continue
+        if entry.formation is None:
+            continue
+        # Takeoff already sizes itself from the climb velocity the user typed
+        # in. Re-planning it here would fight that number (a smooth climb
+        # peaks above the average, so the Z-velocity cap would keep stretching
+        # it).
+        if entry.purpose == "TAKEOFF":
+            continue
+
+        previous = entries[index - 1]
+        gap = entry.frame_start - previous.frame_end
+        hops = _displacements_between_formations(previous, entry)
+        if not hops and drones:
+            # Free segment or a formation without markers: fall back to
+            # wherever the drones actually are.
+            source = get_positions_of(drones, frame=previous.frame_end)
+            target = get_coordinates_of_formation(
+                entry.formation, frame=entry.frame_start
+            )
+            inverse, _clearance = match_points_locally(source, target)
+            hops = displacements_for_assignment(source, target, inverse)
+
+        seconds = required_transition_duration(
+            hops,
+            # Always size the gap for a rest-to-rest curve. A Linear profile
+            # has no finite acceleration; using it here would leave the gap
+            # short and keep the 0 → 28 m/s² flash.
+            profile="SMOOTH",
+            **limits,
+        )
+        needed = max(int(ceil(seconds * fps)), 1)
+        extra = needed - gap
+        if extra > 0:
+            entry.frame_start += extra
+            cascade += extra
+            total_extra += extra
+            log.info(
+                "Lengthened transition into %r by %s frames so it stays "
+                "within %.1f m/s²",
+                entry.name,
+                extra,
+                limits["max_acceleration"],
+            )
+
+    if cascade:
+        storyboard._regenerate_entries_or_transitions()
+
+    return total_extra
+
+
 def recalculate_transitions(
     tasks: Iterable[RecalculationTask], *, start_of_scene: int
-) -> None:
+) -> tuple[int, int]:
     drones = Collections.find_drones().objects
     if not drones:
-        return
+        return 0, 0
+
+    tasks = list(tasks)
+    scene = bpy.context.scene
+    storyboard = getattr(scene.skybrush, "storyboard", None)
+    upgraded = 0
+    extra_frames = 0
 
     # Mapping from drone indices to marker indices in the previous
     # formation, or ``None`` if this is not known for some reason. Possible
@@ -766,6 +1013,24 @@ def recalculate_transitions(
     previous_mapping: Mapping | None = None
 
     with create_position_evaluator() as get_positions_of:
+        if storyboard is not None:
+            upgraded = prepare_show_transition_profiles(storyboard)
+            extra_frames = stretch_storyboard_transitions(
+                storyboard,
+                (task.entry_index for task in tasks),
+                scene=scene,
+                get_positions_of=get_positions_of,
+                drones=drones,
+            )
+            entries = storyboard.entries
+            count = len(entries)
+            for task in tasks:
+                task.start_frame_of_next_entry = (
+                    entries[task.entry_index + 1].frame_start
+                    if task.entry_index + 1 < count
+                    else None
+                )
+
         # Iterate through the entries for which we need to recalculate the
         # transitions
         for task in tasks:
@@ -789,6 +1054,7 @@ def recalculate_transitions(
 
     bpy.ops.skybrush.fix_constraint_ordering()
     invalidate_caches(clear_result=True)
+    return upgraded, extra_frames
 
 
 class RecalculateTransitionsOperator(StoryboardOperator):
@@ -797,7 +1063,10 @@ class RecalculateTransitionsOperator(StoryboardOperator):
     bl_idname = "skybrush.recalculate_transitions"
     bl_label = "Recalculate Transitions"
     bl_description = (
-        "Recalculates all transitions in the show based on the current storyboard"
+        "Recalculates all transitions in the show based on the current "
+        "storyboard. Transitions that are too short for the preferred "
+        "acceleration or the velocity limits are lengthened so the drones "
+        "do not have to start or stop instantaneously"
     )
     bl_options = {"UNDO"}
 
@@ -866,25 +1135,49 @@ class RecalculateTransitionsOperator(StoryboardOperator):
             return {"CANCELLED"}
 
         prefs = get_preferences()
+        stats = (0, 0)
         if not prefs.plan_transitions_locally:
             try:
                 with call_api_from_blender_operator(self, "transition planner"):
-                    recalculate_transitions(tasks, start_of_scene=start_of_scene)
+                    stats = recalculate_transitions(
+                        tasks, start_of_scene=start_of_scene
+                    )
                 bpy.ops.skybrush.update_time_markers_from_storyboard()
                 success = True
             except Exception as ex:
-                log.info(f"Server planning bypassed ({ex}); recalculating transitions locally.")
+                log.info(
+                    f"Server planning bypassed ({ex}); recalculating transitions locally."
+                )
                 setattr(prefs, "plan_transitions_locally", True)
                 try:
-                    recalculate_transitions(tasks, start_of_scene=start_of_scene)
+                    stats = recalculate_transitions(
+                        tasks, start_of_scene=start_of_scene
+                    )
                     bpy.ops.skybrush.update_time_markers_from_storyboard()
                     success = True
                 except Exception:
                     success = False
         else:
-            recalculate_transitions(tasks, start_of_scene=start_of_scene)
+            stats = recalculate_transitions(tasks, start_of_scene=start_of_scene)
             bpy.ops.skybrush.update_time_markers_from_storyboard()
             success = True
+
+        if success:
+            upgraded, extra_frames = stats
+            parts: list[str] = []
+            if upgraded:
+                parts.append(f"set {upgraded} to Smooth")
+            if extra_frames:
+                parts.append(
+                    f"added {extra_frames} frames so accelerations stay bounded"
+                )
+            self.report(
+                {"INFO"},
+                "Recalculated transitions"
+                + (
+                    ": " + "; ".join(parts) if parts else " with a rest-to-rest profile"
+                ),
+            )
 
         return {"FINISHED"} if success else {"CANCELLED"}
 
